@@ -134,6 +134,7 @@ class Controller:
             odometry    = self.data.get('odometry')
             race_status = self.data.get('race_status')
             armed       = self.data.get('armed', False)
+            gates = self.data.get('gates')
 
         # ------------------------------------------------------------------
         # Disarm / sim-restart detection
@@ -241,6 +242,12 @@ class Controller:
                     flush=True
                 )
             
+            
+            # ARRAY OF GATE COORDINATES, SHOULD BE IN ORDER
+            if gates:
+                gate_positions = [[g['pos_x'], g['pos_y'], g['pos_z']] for g in gates]
+
+
             # THESE INPUTS ARE RATES FOR ROLL, PITCH, YAW   
             # units dont really work out cleanly but 0.05 --> 5-7 degrees per second roughly
             # Last input is thrust, 0-1
