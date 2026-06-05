@@ -246,6 +246,26 @@ class Controller:
             y_v = odometry["vy"]
             z_v = odometry["vz"]
 
+            # ------------------------------------------------------------
+            # FRAME CORRECTION — true world-frame vertical velocity
+            # ------------------------------------------------------------
+            # Odometry velocity (vx,vy,vz) is in the drone's BODY frame, but the
+            # altitude controller needs the WORLD-down (NED) component. Rotate the
+            # body velocity into world frame with the attitude quaternion and take
+            # the down component (3rd row of the body->world rotation matrix).
+            # This is SMOOTH because it uses the sim's own velocity — unlike
+            # differentiating position, which was noisy. When level it reduces to
+            # vz, exactly as you'd expect; under tilt it correctly mixes in vx.
+            qw, qx, qy, qz = odometry['qw'], odometry['qx'], odometry['qy'], odometry['qz']
+            vz_world = (2.0*(qx*qz - qw*qy) * x_v
+                        + 2.0*(qy*qz + qw*qx) * y_v
+                        + (1.0 - 2.0*(qx*qx + qy*qy)) * z_v)
+            # World-frame x (north) velocity — same rotation, 1st row. Used by the
+            # horizontal-hold term below to brake the forward coast.
+            vx_world = ((1.0 - 2.0*(qy*qy + qz*qz)) * x_v
+                        + 2.0*(qx*qy - qw*qz) * y_v
+                        + 2.0*(qx*qz + qw*qy) * z_v)
+
             if self._tick % DEBUG_EVERY_N == 0:
                 print(
                     f'[FLY] pos=({x_pos:.1f},{y_pos:.1f},'
@@ -262,10 +282,29 @@ class Controller:
 
 
             # PITCH PID CONTROLLER 
-            pitch_des = 2  # logic for this should be replaced later
+            # ATTITUDE NOTE: the interface is RATE-like — commanding 0 HOLDS the
+            # current tilt, it does NOT return to level (that's why zeroing
+            # pitchCommand last run froze the launch tilt and the drone flew off).
+            # Keeping an ACTIVE command with setpoint 0 commands a corrective rate
+            # that decays the angle to level. Leveling is what lets the hover
+            # thrust below (calibrated at level) actually hold altitude.
+            # I own attitude on this branch (was pitch_des = 2).
+            # HORIZONTAL HOLD (v1 — forward-velocity damping; this WILL evolve into
+            # a proper position hold later). The sim has no aero drag, so once
+            # level the drone coasts forward on the speed it built up at launch.
+            # Command a small corrective pitch proportional to world-x speed to
+            # actively brake it; when speed reaches ~0, pitch_des -> 0 (level), so
+            # it halts and holds. Sign grounded in observed data: at launch
+            # NEGATIVE pitch drove x negative (forward), so to push x back POSITIVE
+            # we need POSITIVE pitch -> pitch_des = -K_VX * vx_world (vx_world < 0
+            # while coasting -> nose up). Clamped to a small tilt so braking never
+            # costs much altitude (vertical thrust ~ cos(tilt)).
+            K_VX = 1.0           # deg of corrective pitch per m/s of world-x speed
+            PITCH_LIMIT = 8.0    # deg, max braking tilt
+            pitch_des = float(np.clip(-K_VX * vx_world, -PITCH_LIMIT, PITCH_LIMIT))
 
-            K_P_pitch = 0.005    # can definitely be increased for snappier responses
-            K_D_pitch = 0.0001   # should be increased at a similar percent to how much we increased K_P
+            K_P_pitch = 0.015    # raised from 0.005: levels the ~18° launch pitch in ~1s, not ~4s
+            K_D_pitch = 0.001    # raised with K_P for damping (lower K_P if it oscillates)
 
             err_pitch = pitch_des - pitch_deg
 
@@ -274,10 +313,10 @@ class Controller:
 
 
             # ROLL PID CONTROLLER 
-            roll_des = 10  # logic for this should be replaced later
+            roll_des = 0.0  # level (was roll_des = 10)
 
-            K_P_roll = 0.005    # can definitely be increased for snappier responses
-            K_D_roll = 0.0001   # should be increased at a similar percent to how much we increased K_P
+            K_P_roll = 0.015    # raised from 0.005 to match pitch (roll starts ~level, but stay symmetric)
+            K_D_roll = 0.001    # raised with K_P for damping
 
             err_roll = roll_des - roll_deg
 
@@ -289,6 +328,9 @@ class Controller:
 
             elev_des = -3   # logic for this should be replaced later
 
+            # HOVER 0.26567 only holds the drone up when it is LEVEL (see the
+            # attitude block above) — a tilted drone needs thrust/cos(tilt).
+            # The D-term now uses vz_world (frame-corrected) instead of body vz.
             thrust_trim = 0.26567  # experimentally determined, this is damn near correct +/- 0.0001
             
             K_P_thrust = 0.015    # similar tuning situation as pitch controller
@@ -296,9 +338,28 @@ class Controller:
 
             err_elev = elev_des - z_pos
 
-            thrustCommand = thrust_trim - err_elev * K_P_thrust  + z_v * K_D_thrust 
+            thrustCommand = thrust_trim - err_elev * K_P_thrust  + vz_world * K_D_thrust
 
             thrustCommand = np.clip(thrustCommand, 0, 1)
+
+            # --- CSV logging (toggle: LOG_CSV = False to disable) -----------
+            # Verify BOTH lanes at once: roll_deg/pitch_deg -> 0 (leveling) and
+            # z -> elev_des with vz_world -> 0 (altitude). vz_body is kept beside
+            # vz_world so you can see the frame correction at work under tilt.
+            # File overwritten each run, line-buffered (survives Ctrl-C).
+            LOG_CSV = True
+            if LOG_CSV:
+                alt_csv = getattr(self, '_alt_csv', None)
+                if alt_csv is None:
+                    alt_csv = open('altitude_log.csv', 'w', buffering=1)
+                    alt_csv.write('tick,x,y,z,z_des,vx_body,vx_world,vz_body,vz_world,'
+                                  'pitch_des,roll_deg,pitch_deg,yaw_deg,thrust\n')
+                    self._alt_csv = alt_csv
+                alt_csv.write(
+                    f'{self._tick},{x_pos:.3f},{y_pos:.3f},{z_pos:.3f},{elev_des:.3f},'
+                    f'{x_v:.3f},{vx_world:.3f},{z_v:.3f},{vz_world:.3f},{pitch_des:.2f},'
+                    f'{roll_deg:.2f},{pitch_deg:.2f},{yaw_deg:.2f},{thrustCommand:.4f}\n'
+                )
 
 
 
