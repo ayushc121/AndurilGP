@@ -272,11 +272,29 @@ class Controller:
             pitchCommand = K_P_pitch*err_pitch  -  K_D_pitch*pitch_rate
 
 
+            # THRUST PID
+
+            elev_des = -3   # logic for this should be replaced later
+
+
+            thrust_trim = 0.26567  # experimentally determined, this is damn near correct +/- 0.0001
+            
+            K_P_thrust = 0.015    # COEFFICIENTS NEED MUCH TUNING
+            K_D_thrust = 0.005
+
+            err_elev = elev_des - z_pos
+
+            thrustCommand = thrust_trim - err_elev * K_P_thrust  + z_v * K_D_thrust 
+
+            thrustCommand = np.clip(thrustCommand, 0, 1)
+
+
+
 
             # THESE INPUTS ARE RATES FOR ROLL, PITCH, YAW   
             # units dont really work out cleanly but 0.05 --> 5-7 degrees per second roughly
             # Last input is thrust, 0-1
-            self._send_attitude_rates(0.0, pitchCommand, 0.0, 0.5)
+            self._send_attitude_rates(0.0, pitchCommand, 0.0, thrustCommand)
 
 
             time.sleep(1.0 / CONTROL_HZ)
