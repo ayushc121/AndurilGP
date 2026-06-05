@@ -218,40 +218,65 @@ class Controller:
                 time.sleep(1.0 / CONTROL_HZ)
                 return
 
+            # EXTRACTING RELEVANT DATA FROM ODOMETRY
             yaw = quat_to_yaw(
                 odometry['qw'], odometry['qx'],
                 odometry['qy'], odometry['qz']
             )
-
             yaw_deg = math.degrees(yaw)
 
-            if self._tick % DEBUG_EVERY_N == 0:
-                roll_deg  = math.degrees(math.atan2(
+            roll_deg  = math.degrees(math.atan2(
                     2*(odometry['qw']*odometry['qx'] + odometry['qy']*odometry['qz']),
                     1 - 2*(odometry['qx']**2 + odometry['qy']**2)
                 ))
-                pitch_deg = math.degrees(math.asin(max(-1, min(1,
+
+            pitch_deg = math.degrees(math.asin(max(-1, min(1,
                     2*(odometry['qw']*odometry['qy'] - odometry['qz']*odometry['qx'])
                 ))))
+
+            yaw_rate = odometry['yawspeed']
+            roll_rate = odometry['rollspeed']
+            pitch_rate = odometry['pitchspeed']
+
+            x_pos = odometry["x"]
+            y_pos = odometry["y"]
+            z_pos = odometry["z"]
+
+            x_v = odometry["vx"]
+            y_v = odometry["vy"]
+            z_v = odometry["vz"]
+
+            if self._tick % DEBUG_EVERY_N == 0:
                 print(
-                    f'[FLY] pos=({odometry["x"]:.1f},{odometry["y"]:.1f},'
-                    f'{odometry["z"]:.2f})  '
-                    f'vel=({odometry["vx"]:.2f},{odometry["vy"]:.2f},'
-                    f'{odometry["vz"]:.2f})  '
+                    f'[FLY] pos=({x_pos:.1f},{y_pos:.1f},'
+                    f'{z_pos:.2f})  '
+                    f'vel=({x_v:.2f},{y_v:.2f},'
+                    f'{z_v:.2f})  '
                     f'roll={roll_deg:.1f}° pitch={pitch_deg:.1f}° yaw={yaw_deg:.1f}°',
                     flush=True
                 )
-            
             
             # ARRAY OF GATE COORDINATES, SHOULD BE IN ORDER
             if gates:
                 gate_positions = [[g['pos_x'], g['pos_y'], g['pos_z']] for g in gates]
 
 
+            # PITCH PID CONTROLLER 
+            pitch_des = 0  # logic for this should be replaced later
+
+            K_P_pitch = 0.005    # can definitely be increased for snappier responses
+            K_D_pitch = 0.0001   # should be increased at a similar percent to how much we increased K_P
+
+            err_pitch = pitch_des - pitch_deg
+
+            pitchCommand = K_P_pitch*err_pitch  -  K_D_pitch*pitch_rate
+
+
+
             # THESE INPUTS ARE RATES FOR ROLL, PITCH, YAW   
             # units dont really work out cleanly but 0.05 --> 5-7 degrees per second roughly
             # Last input is thrust, 0-1
-            self._send_attitude_rates(0.0, 0.0, 0.0, 0.7)
+            self._send_attitude_rates(0.0, pitchCommand, 0.0, 0.5)
 
 
             time.sleep(1.0 / CONTROL_HZ)
