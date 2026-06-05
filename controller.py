@@ -262,7 +262,7 @@ class Controller:
 
 
             # PITCH PID CONTROLLER 
-            pitch_des = 0  # logic for this should be replaced later
+            pitch_des = 2  # logic for this should be replaced later
 
             K_P_pitch = 0.005    # can definitely be increased for snappier responses
             K_D_pitch = 0.0001   # should be increased at a similar percent to how much we increased K_P
@@ -272,15 +272,27 @@ class Controller:
             pitchCommand = K_P_pitch*err_pitch  -  K_D_pitch*pitch_rate
 
 
-            # THRUST PID
+
+            # ROLL PID CONTROLLER 
+            roll_des = 10  # logic for this should be replaced later
+
+            K_P_roll = 0.005    # can definitely be increased for snappier responses
+            K_D_roll = 0.0001   # should be increased at a similar percent to how much we increased K_P
+
+            err_roll = roll_des - roll_deg
+
+            rollCommand = K_P_roll*err_roll  -  K_D_roll*roll_rate
+
+
+
+            # THRUST PID (may want to add integral term...)
 
             elev_des = -3   # logic for this should be replaced later
 
-
             thrust_trim = 0.26567  # experimentally determined, this is damn near correct +/- 0.0001
             
-            K_P_thrust = 0.015    # COEFFICIENTS NEED MUCH TUNING
-            K_D_thrust = 0.005
+            K_P_thrust = 0.015    # similar tuning situation as pitch controller
+            K_D_thrust = 0.022
 
             err_elev = elev_des - z_pos
 
@@ -294,7 +306,7 @@ class Controller:
             # THESE INPUTS ARE RATES FOR ROLL, PITCH, YAW   
             # units dont really work out cleanly but 0.05 --> 5-7 degrees per second roughly
             # Last input is thrust, 0-1
-            self._send_attitude_rates(0.0, pitchCommand, 0.0, thrustCommand)
+            self._send_attitude_rates(rollCommand, pitchCommand, 0.0, thrustCommand)
 
 
             time.sleep(1.0 / CONTROL_HZ)
