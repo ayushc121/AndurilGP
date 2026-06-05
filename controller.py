@@ -260,6 +260,11 @@ class Controller:
             vz_world = (2.0*(qx*qz - qw*qy) * x_v
                         + 2.0*(qy*qz + qw*qx) * y_v
                         + (1.0 - 2.0*(qx*qx + qy*qy)) * z_v)
+            # World-frame x (north) velocity — same rotation, 1st row. Used by the
+            # horizontal-hold term below to brake the forward coast.
+            vx_world = ((1.0 - 2.0*(qy*qy + qz*qz)) * x_v
+                        + 2.0*(qx*qy - qw*qz) * y_v
+                        + 2.0*(qx*qz + qw*qy) * z_v)
 
             if self._tick % DEBUG_EVERY_N == 0:
                 print(
@@ -284,7 +289,19 @@ class Controller:
             # that decays the angle to level. Leveling is what lets the hover
             # thrust below (calibrated at level) actually hold altitude.
             # I own attitude on this branch (was pitch_des = 2).
-            pitch_des = 0.0  # level
+            # HORIZONTAL HOLD (v1 — forward-velocity damping; this WILL evolve into
+            # a proper position hold later). The sim has no aero drag, so once
+            # level the drone coasts forward on the speed it built up at launch.
+            # Command a small corrective pitch proportional to world-x speed to
+            # actively brake it; when speed reaches ~0, pitch_des -> 0 (level), so
+            # it halts and holds. Sign grounded in observed data: at launch
+            # NEGATIVE pitch drove x negative (forward), so to push x back POSITIVE
+            # we need POSITIVE pitch -> pitch_des = -K_VX * vx_world (vx_world < 0
+            # while coasting -> nose up). Clamped to a small tilt so braking never
+            # costs much altitude (vertical thrust ~ cos(tilt)).
+            K_VX = 1.0           # deg of corrective pitch per m/s of world-x speed
+            PITCH_LIMIT = 8.0    # deg, max braking tilt
+            pitch_des = float(np.clip(-K_VX * vx_world, -PITCH_LIMIT, PITCH_LIMIT))
 
             K_P_pitch = 0.015    # raised from 0.005: levels the ~18° launch pitch in ~1s, not ~4s
             K_D_pitch = 0.001    # raised with K_P for damping (lower K_P if it oscillates)
@@ -335,12 +352,12 @@ class Controller:
                 alt_csv = getattr(self, '_alt_csv', None)
                 if alt_csv is None:
                     alt_csv = open('altitude_log.csv', 'w', buffering=1)
-                    alt_csv.write('tick,x,y,z,z_des,vz_body,vz_world,'
-                                  'roll_deg,pitch_deg,yaw_deg,thrust\n')
+                    alt_csv.write('tick,x,y,z,z_des,vx_body,vx_world,vz_body,vz_world,'
+                                  'pitch_des,roll_deg,pitch_deg,yaw_deg,thrust\n')
                     self._alt_csv = alt_csv
                 alt_csv.write(
                     f'{self._tick},{x_pos:.3f},{y_pos:.3f},{z_pos:.3f},{elev_des:.3f},'
-                    f'{z_v:.3f},{vz_world:.3f},'
+                    f'{x_v:.3f},{vx_world:.3f},{z_v:.3f},{vz_world:.3f},{pitch_des:.2f},'
                     f'{roll_deg:.2f},{pitch_deg:.2f},{yaw_deg:.2f},{thrustCommand:.4f}\n'
                 )
 
