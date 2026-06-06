@@ -4,3 +4,5 @@ __pycache__/
 
 # Generated diagnostic logs (regenerated on every run)
 altitude_log.csv
+gate_log.csv
+gate_packets.csv
