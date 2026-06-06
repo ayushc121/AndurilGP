@@ -280,7 +280,7 @@ class Controller:
             # GATE TARGETING
             # ----------------------------------------------------------------
 
-            V_MAX     = 100.0     # m/s horizontal cap
+            V_MAX     = 20.0     # m/s horizontal cap
             K_POS     = 1.5     # m/s per m of horizontal error
 
             v_des_north = 0.0           # setpoints default to hover / hold when no gate
@@ -304,7 +304,7 @@ class Controller:
                 gate_pz =  ga['pos_z']
                 g_down  = +gate_pz
 
-                vec_n = g_north - x_pos + ((g_north - x_pos) / np.abs(g_north - x_pos))*4
+                vec_n = g_north - x_pos + ((g_north - x_pos) / np.abs(g_north - x_pos))*4      # Ghost Targeting for more aggressive speed
                 vec_e = g_east  - y_pos
 
                 # Horizontal velocity setpoints (P on position, capped -> auto-slow in).
@@ -312,7 +312,7 @@ class Controller:
                 v_des_east  = float(np.clip(K_POS * vec_e, -V_MAX, V_MAX))
 
                 # Altitude: 
-                elev_des = gate_pz - 0.8
+                elev_des = gate_pz - 0.8          # Gate z coordinate points to bottom of gate
 
 
             # PITCH PID CONTROLLER
@@ -361,7 +361,7 @@ class Controller:
 
 
             # THRUST PID
-            thrust_trim = 0.26567  # experimentally determined, this is damn near correct +/- 0.0001
+            thrust_trim = 0.26567  # experimentally determined, this is near correct +/- 0.0001
             
             K_P_thrust = 0.07
             K_D_thrust = 0.046
