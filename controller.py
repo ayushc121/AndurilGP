@@ -265,6 +265,11 @@ class Controller:
             vx_world = ((1.0 - 2.0*(qy*qy + qz*qz)) * x_v
                         + 2.0*(qx*qy - qw*qz) * y_v
                         + 2.0*(qx*qz + qw*qy) * z_v)
+            # World-frame y (east) velocity — 2nd row of the body->world rotation.
+            # Needed for the east/roll loop and the roll-sign test below.
+            vy_world = (2.0*(qx*qy + qw*qz) * x_v
+                        + (1.0 - 2.0*(qx*qx + qz*qz)) * y_v
+                        + 2.0*(qy*qz - qw*qx) * z_v)
 
             if self._tick % DEBUG_EVERY_N == 0:
                 print(
@@ -280,8 +285,109 @@ class Controller:
             if gates:
                 gate_positions = [[g['pos_x'], g['pos_y'], g['pos_z']] for g in gates]
 
+            # ================================================================
+            # GATE TARGETING — frame RESOLVED from logged data (gate_packets.csv).
+            # ----------------------------------------------------------------
+            # VERDICT (3 sim re-entries, all logged):
+            #  * Track data is sent ONCE per race, AT SPAWN: drone pos @ receipt was
+            #    (0,0,~0) every time, so reported gate coords ARE world coords in the
+            #    arm-origin frame (relative == reported + 0). The absolute-vs-relative
+            #    question is moot, and the displacement test was never possible (one
+            #    packet per flight; re-entry resets odometry to origin).
+            #  * HORIZONTAL AXES (confirmed): gate pos_x -> world NORTH (odom x),
+            #    pos_y -> world EAST (odom y), SAME sign (flying -x carried the drone
+            #    down the gate-x line to -131).
+            #  * VERTICAL (pos_z) SIGN RESOLVED = NED-DOWN, same frame as odometry:
+            #    world-down  g_down = +pos_z  (NO flip). Proof (flythrough log + pilot):
+            #    every camera detection put the gate at the BOTTOM of the frame
+            #    (vis_cy_off mean +132 of 180) despite the 20deg-UP camera tilt, and
+            #    detection dropped to 0 at each closest pass (gate slid UNDER us). The
+            #    course DESCENDS: spawn high, gate0 ~ origin, gate5 ~26 m BELOW. To fly
+            #    THROUGH a gate, DESCEND to elev_des = +pos_z. (terrain drops away ahead,
+            #    so descending toward a gate is open air, not floor — but ramp + clamp.)
+            # ================================================================
+            # PATH-PLANNER (GUIDANCE) — waypoint follower over the 6 gates.
+            # ----------------------------------------------------------------
+            # Produces the desired SETPOINTS (pitch_des, roll_des, elev_des); the inner
+            # PID/thrust loops below (teammate's half) turn them into commands. INTERFACE
+            # = those *_des variables. FROZEN conventions (do NOT change either side):
+            #   NED; +pitch_des -> world NORTH; +roll_des -> world EAST (S=+1, MEASURED);
+            #   elev_des = +gate pos_z (down); yaw FIXED. vx/vy/vz_world are the shared
+            #   frame-corrected velocity measurements.
+            # Cascade per axis: position error -> desired velocity (P, capped at V_MAX so
+            # it auto-slows into the gate) -> desired attitude (in the PID blocks below).
+            # Altitude ramps toward the ACTIVE gate's depth so the P-D thrust loop tracks
+            # the descent without windup (the integral is the teammate's add).
+            V_MAX     = 4.0     # m/s horizontal cap (accuracy > speed)
+            K_POS     = 0.3     # m/s per m of horizontal error (full V_MAX beyond ~13 m)
+            ELEV_RAMP = 1.5     # m/s max change of elev_des (gentle, P-D-trackable)
+            ELEV_CLEAR = 1.0    # m of clearance ABOVE gate centre (fly the upper half of
+                                # the 2.72 m opening) -> clean takeoff + ground margin
+            ADVANCE_R = 3.0     # m, local-fallback waypoint advance radius (3-D)
+            ELEV_MIN, ELEV_MAX = -5.0, 28.0   # clamp elev_des (NED down): 5 m up .. 28 m down
 
-            # PITCH PID CONTROLLER 
+            v_des_north = 0.0           # setpoints default to hover / hold when no gate
+            v_des_east  = 0.0
+            elev_des    = -3.0
+            if gates:
+                if gates is not getattr(self, '_gates_ref', None):
+                    self._gates_ref = gates
+                    print(f'[GATE] track packet: {len(gates)} gates, '
+                          f'drone@receipt=({x_pos:.2f},{y_pos:.2f},{z_pos:.2f})', flush=True)
+
+                n = len(gates)
+                # SEQUENCING: the sim's active_gate_index is GROUND TRUTH for a real pass.
+                # Keep a local index that never falls behind it; the local-radius advance
+                # is only a FALLBACK (it can cut a corner without a true crossing), so we
+                # trust the sim's index whenever it is ahead.
+                active_idx = race_status['active_gate_index'] if race_status else -1
+                self._wp = getattr(self, '_wp', 0)
+                if active_idx > self._wp:
+                    self._wp = active_idx
+                self._wp = max(0, min(self._wp, n - 1))
+                ai = self._wp
+                ga = gates[ai]
+
+                # Active gate in WORLD-NED (all axes + signs resolved & frozen above).
+                g_north =  ga['pos_x']
+                g_east  =  ga['pos_y']
+                gate_pz =  ga['pos_z']
+                g_down  = +gate_pz
+
+                vec_n = g_north - x_pos
+                vec_e = g_east  - y_pos
+                vec_d = g_down  - z_pos          # <0 => gate is ABOVE the drone
+                horiz_dist = math.hypot(vec_n, vec_e)
+                dist3d     = math.sqrt(vec_n*vec_n + vec_e*vec_e + vec_d*vec_d)
+                bearing    = math.degrees(math.atan2(vec_e, vec_n))
+                alt_err    = vec_d
+
+                # Horizontal velocity setpoints (P on position, capped -> auto-slow in).
+                v_des_north = float(np.clip(K_POS * vec_n, -V_MAX, V_MAX))
+                v_des_east  = float(np.clip(K_POS * vec_e, -V_MAX, V_MAX))
+
+                # Altitude: ramp elev_des toward the ACTIVE gate's depth MINUS clearance
+                # (= fly 1 m above gate centre), never toward a far gate. Clamped. Seeded
+                # at current z so it starts where we are.
+                elev_target = g_down - ELEV_CLEAR     # NED: subtract -> 1 m higher
+                self._elev_des = getattr(self, '_elev_des', z_pos)
+                step = float(np.clip(elev_target - self._elev_des,
+                                     -ELEV_RAMP / CONTROL_HZ, ELEV_RAMP / CONTROL_HZ))
+                self._elev_des = float(np.clip(self._elev_des + step, ELEV_MIN, ELEV_MAX))
+                elev_des = self._elev_des
+
+                # Local advance (FALLBACK only) — arms the NEXT waypoint. Two triggers:
+                #  (a) within ADVANCE_R in 3-D, or (b) crossed the gate's plane (vec_n>0,
+                #  i.e. drone is now beyond the gate's north on this -x course) while
+                #  horizontally close — robust to altitude following-lag. Sim's
+                #  active_gate_index remains the ground truth for an actual scored pass.
+                passed_plane = (vec_n > 0.0 and horiz_dist < 5.0)
+                if self._wp < n - 1 and (dist3d < ADVANCE_R or passed_plane):
+                    self._wp += 1
+                    print(f'[WP] local-advance -> gate {self._wp} '
+                          f'(dist3d {dist3d:.1f} m, passed_plane={passed_plane})', flush=True)
+
+            # PITCH PID CONTROLLER
             # ATTITUDE NOTE: the interface is RATE-like — commanding 0 HOLDS the
             # current tilt, it does NOT return to level (that's why zeroing
             # pitchCommand last run froze the launch tilt and the drone flew off).
@@ -299,9 +405,17 @@ class Controller:
             # we need POSITIVE pitch -> pitch_des = -K_VX * vx_world (vx_world < 0
             # while coasting -> nose up). Clamped to a small tilt so braking never
             # costs much altitude (vertical thrust ~ cos(tilt)).
-            K_VX = 1.0           # deg of corrective pitch per m/s of world-x speed
-            PITCH_LIMIT = 8.0    # deg, max braking tilt
-            pitch_des = float(np.clip(-K_VX * vx_world, -PITCH_LIMIT, PITCH_LIMIT))
+            # NORTH velocity-tracking law: convert the north-velocity setpoint
+            # (v_des_north, from the gate position loop above; 0 = hover when no gate)
+            # into a corrective pitch. SIGN confirmed empirically: commanding +north
+            # drove the drone BACKWARDS, i.e. negative pitch -> -x (north-decreasing)
+            # motion, so err_v = v_des - vx_world with pitch_des = K_VX*err_v is the
+            # correct, stable law (overshoot in -x makes err_v>0 -> +pitch -> brake).
+            # V_des=0 reduces to the old brake-to-hover exactly. Tilt clamped so braking
+            # never costs much vertical thrust (~cos(tilt)).
+            K_VX = 2.0           # deg of corrective pitch per m/s of north-speed error
+            PITCH_LIMIT = 12.0   # deg, max tilt
+            pitch_des = float(np.clip(K_VX * (v_des_north - vx_world), -PITCH_LIMIT, PITCH_LIMIT))
 
             K_P_pitch = 0.015    # raised from 0.005: levels the ~18° launch pitch in ~1s, not ~4s
             K_D_pitch = 0.001    # raised with K_P for damping (lower K_P if it oscillates)
@@ -312,8 +426,14 @@ class Controller:
 
 
 
-            # ROLL PID CONTROLLER 
-            roll_des = 0.0  # level (was roll_des = 10)
+            # ROLL PID CONTROLLER
+            # EAST velocity-tracking law — direct MIRROR of the north/pitch law. Sign
+            # MEASURED (S=+1): a commanded +5deg roll drove the drone +EAST (vy_world
+            # +4.15 m/s), so roll_des = K_VY*(v_des_east - vy_world): overshoot east makes
+            # err<0 -> -roll -> brake. v_des_east=0 -> levels & holds. Clamped like pitch.
+            K_VY = 2.0           # deg of corrective roll per m/s of east-speed error
+            ROLL_LIMIT = 12.0    # deg, max tilt
+            roll_des = float(np.clip(K_VY * (v_des_east - vy_world), -ROLL_LIMIT, ROLL_LIMIT))
 
             K_P_roll = 0.015    # raised from 0.005 to match pitch (roll starts ~level, but stay symmetric)
             K_D_roll = 0.001    # raised with K_P for damping
@@ -324,9 +444,11 @@ class Controller:
 
 
 
-            # THRUST PID (may want to add integral term...)
-
-            elev_des = -3   # logic for this should be replaced later
+            # THRUST PID (teammate's half — gains/integral live here).
+            # elev_des is now supplied by the GUIDANCE block above (ramped toward the
+            # active gate's depth, NED down). Default -3 when no gate data. The descending
+            # course will leave a P-D following lag (~vz*K_D/K_P); that's the cue to add
+            # the integral here (anti-windup). Do NOT recompute elev_des in this block.
 
             # HOVER 0.26567 only holds the drone up when it is LEVEL (see the
             # attitude block above) — a tilted drone needs thrust/cos(tilt).
@@ -361,10 +483,45 @@ class Controller:
                     f'{roll_deg:.2f},{pitch_deg:.2f},{yaw_deg:.2f},{thrustCommand:.4f}\n'
                 )
 
+            # --- GATE navigation log (only while gate data is present) ----------
+            # Written here (not in the gate block) so pitch_des/thrustCommand exist.
+            # Watch: vec_n -> 0 and v_des_north -> 0 as the drone parks at gate 0's x;
+            # alt_err shows the (deferred) climb each gate needs (negative => above us).
+            if gates:
+                # Camera gate estimate (published lock-free by vision_rx). cy_offset>0
+                # => gate is BELOW image centre. With the 20deg-up camera tilt this is
+                # the key tell for the UNRESOLVED vertical sign: a far gate with large
+                # raw pos_z appearing LOW/below us supports hyp B, high/above supports A.
+                vis = self.data.get('vision_gate_estimate')
+                vcx = vis['cx_offset'] if vis else float('nan')
+                vcy = vis['cy_offset'] if vis else float('nan')
+                var = vis['area']      if vis else 0.0
+                gate_csv = getattr(self, '_gate_csv', None)
+                if gate_csv is None:
+                    gate_csv = open('gate_log.csv', 'w', buffering=1)
+                    gate_csv.write(
+                        'tick,active_idx,wp,drone_x,drone_y,drone_z,'
+                        'g_north,g_east,g_down,gate_pz,gate_w,gate_h,'
+                        'vec_n,vec_e,vec_d,horiz_dist,dist3d,bearing,alt_err,'
+                        'elev_des,v_des_north,v_des_east,vx_world,vy_world,'
+                        'roll_deg,roll_des,pitch_des,thrust,'
+                        'vis_cx_off,vis_cy_off,vis_area\n')
+                    self._gate_csv = gate_csv
+                gate_csv.write(
+                    f'{self._tick},{active_idx},{self._wp},{x_pos:.3f},{y_pos:.3f},{z_pos:.3f},'
+                    f'{g_north:.3f},{g_east:.3f},{g_down:.3f},{gate_pz:.3f},'
+                    f'{ga["width"]:.2f},{ga["height"]:.2f},'
+                    f'{vec_n:.3f},{vec_e:.3f},{vec_d:.3f},'
+                    f'{horiz_dist:.3f},{dist3d:.3f},{bearing:.2f},{alt_err:.3f},'
+                    f'{elev_des:.3f},{v_des_north:.3f},{v_des_east:.3f},{vx_world:.3f},{vy_world:.3f},'
+                    f'{roll_deg:.2f},{roll_des:.2f},'
+                    f'{pitch_des:.2f},{thrustCommand:.4f},'
+                    f'{vcx:.1f},{vcy:.1f},{var:.0f}\n')
 
 
 
-            # THESE INPUTS ARE RATES FOR ROLL, PITCH, YAW   
+
+            # THESE INPUTS ARE RATES FOR ROLL, PITCH, YAW
             # units dont really work out cleanly but 0.05 --> 5-7 degrees per second roughly
             # Last input is thrust, 0-1
             self._send_attitude_rates(rollCommand, pitchCommand, 0.0, thrustCommand)
