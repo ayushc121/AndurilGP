@@ -1,8 +1,0 @@
-# Python
-__pycache__/
-*.py[cod]
-
-# Generated diagnostic logs (regenerated on every run)
-altitude_log.csv
-gate_log.csv
-gate_packets.csv
