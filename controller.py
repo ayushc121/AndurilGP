@@ -349,20 +349,16 @@ class Controller:
                 # 5. Apply strictly to map coordinates
                 g_north = x_pos + (est_distance_3d * rw_x)
                 g_east = y_pos + (est_distance_3d * rw_y)
-                gate_pz = z_pos + (est_distance_3d * rw_z)
-
+                gate_pz = z_pos + (est_distance_3d * rw_z) + 1
+            
+            else:
+                g_north = 0
+                g_east = 0
+                gate_pz = -3
 
             # ================================================================
             # ODOMETRY BASED GATE TARGETING
             # ----------------------------------------------------------------
-
-            V_MAX     = 20.0     # m/s horizontal cap
-            K_POS     = 1.7     # m/s per m of horizontal error
-
-            v_des_north = 0.0           # setpoints default to hover / hold when no gate
-            v_des_east  = 0.0
-            elev_des    = -3.0
-
             if gates:
                 if gates is not getattr(self, '_gates_ref', None):
                     self._gates_ref = gates
@@ -383,6 +379,13 @@ class Controller:
             # ================================================================
             # DESIRED PATH GENERATION
             # ----------------------------------------------------------------
+
+            V_MAX     = 20.0     # m/s horizontal cap
+            K_POS     = 1.7     # m/s per m of horizontal error
+
+            v_des_north = 0.0           # setpoints default to hover / hold when no gate
+            v_des_east  = 0.0
+            elev_des    = -3.0
 
             vec_n = g_north - x_pos
             vec_e = g_east  - y_pos
