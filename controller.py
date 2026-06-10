@@ -9,6 +9,7 @@ from pymavlink import mavutil
 # -----------------------------------------------------------------------
 
 CONTROL_HZ = 50          # spec hard-limits < 100 Hz
+FX = FY      = 320.0
 
 ARM_RETRY_S      = 1.0
 POST_DISARM_WAIT = 0.25
@@ -276,12 +277,87 @@ class Controller:
                     flush=True
                 )
 
+
             # ================================================================
-            # GATE TARGETING
+            # VISUAL BASED GATE TARGETING
+            # ----------------------------------------------------------------
+            vision = self.data.get('vision_gate_estimate')    
+
+            if vision is not None:
+                # ==========================================
+                # SLAM - CONTINUOUS MAPPING
+                # ==========================================
+                FX = 320.0
+                FY = 320.0
+                CX = 320.0
+                CY = 180.0
+                
+                # 1. True Center (Immune to hollow-contour centroid shifting)
+                true_cx = vision['bx'] + (vision['bw'] / 2.0)
+                true_cy = vision['by'] + (vision['bh'] / 2.0)
+
+                # Pixel vector in Camera Frame
+                vc_x = true_cx - CX
+                vc_y = true_cy - CY
+                vc_z = FX 
+
+                # 2. Exact Distance using Width (Immune to camera pitch distortion)
+                # Real width of gate is 2.7m. Pin-hole horizontal distance:
+                z_dist_cam = (2.7 * FX) / vision['bw']
+                
+                # Scale it out to the full 3D hypotenuse ray length
+                ray_norm = math.sqrt(vc_x**2 + vc_y**2 + vc_z**2)
+                est_distance_3d = z_dist_cam * (ray_norm / vc_z)
+
+                # Normalize the pixel vector for pure rotation
+                rc_x = vc_x / ray_norm
+                rc_y = vc_y / ray_norm
+                rc_z = vc_z / ray_norm
+
+                # 3. Rotate to Body Frame (Apply +20 deg camera tilt)
+                tilt_rad = math.radians(20.0)
+                ctilt = math.cos(tilt_rad); stilt = math.sin(tilt_rad)
+                
+                rb_x = rc_z * ctilt + rc_y * stilt
+                rb_y = rc_x
+                rb_z = -rc_z * stilt + rc_y * ctilt
+
+                # 4. Rotate to NED World Frame using Drone IMU
+                phi = math.radians(roll_deg)
+                theta = math.radians(pitch_deg)
+                psi = math.radians(yaw_deg)
+
+                c_phi = math.cos(phi); s_phi = math.sin(phi)
+                c_the = math.cos(theta); s_the = math.sin(theta)
+                c_psi = math.cos(psi); s_psi = math.sin(psi)
+
+                # Roll (X-axis)
+                r1_x = rb_x
+                r1_y = rb_y * c_phi - rb_z * s_phi
+                r1_z = rb_y * s_phi + rb_z * c_phi
+
+                # Pitch (Y-axis)
+                r2_x = r1_x * c_the + r1_z * s_the
+                r2_y = r1_y
+                r2_z = -r1_x * s_the + r1_z * c_the
+
+                # Yaw (Z-axis) - This yields the final normalized World Vector
+                rw_x = r2_x * c_psi - r2_y * s_psi
+                rw_y = r2_x * s_psi + r2_y * c_psi
+                rw_z = r2_z
+
+                # 5. Apply strictly to map coordinates
+                g_north = x_pos + (est_distance_3d * rw_x)
+                g_east = y_pos + (est_distance_3d * rw_y)
+                gate_pz = z_pos + (est_distance_3d * rw_z)
+
+
+            # ================================================================
+            # ODOMETRY BASED GATE TARGETING
             # ----------------------------------------------------------------
 
             V_MAX     = 20.0     # m/s horizontal cap
-            K_POS     = 1.5     # m/s per m of horizontal error
+            K_POS     = 1.7     # m/s per m of horizontal error
 
             v_des_north = 0.0           # setpoints default to hover / hold when no gate
             v_des_east  = 0.0
@@ -298,22 +374,30 @@ class Controller:
                 if active_idx < len(gates):
                     ga = gates[active_idx]
 
-                # Active gate in WORLD-NED (all axes + signs resolved & frozen above).
-                g_north =  ga['pos_x']
-                g_east  =  ga['pos_y']
-                gate_pz =  ga['pos_z']
-                g_down  = +gate_pz
+                    # Active gate in WORLD-NED (all axes + signs resolved & frozen above).
+                    g_north =  ga['pos_x']
+                    g_east  =  ga['pos_y']
+                    gate_pz =  ga['pos_z']
 
-                vec_n = g_north - x_pos + ((g_north - x_pos) / np.abs(g_north - x_pos))*4      # Ghost Targeting for more aggressive speed
-                vec_e = g_east  - y_pos
 
-                # Horizontal velocity setpoints (P on position, capped -> auto-slow in).
-                v_des_north = float(np.clip(K_POS * vec_n, -V_MAX, V_MAX))
-                v_des_east  = float(np.clip(K_POS * vec_e, -V_MAX, V_MAX))
+            # ================================================================
+            # DESIRED PATH GENERATION
+            # ----------------------------------------------------------------
 
-                # Altitude: 
-                elev_des = gate_pz - 0.8          # Gate z coordinate points to bottom of gate
+            vec_n = g_north - x_pos
+            vec_e = g_east  - y_pos
 
+            # Horizontal velocity setpoints (P on position, capped -> auto-slow in).
+            v_des_north = 35 * np.sign(vec_n) + float(np.clip(K_POS * vec_n, -V_MAX, V_MAX)) * 0.15
+            v_des_east  = float(np.clip(K_POS * vec_e, -V_MAX, V_MAX))
+
+            # Altitude: 
+            elev_des = gate_pz - 0.8
+
+            
+            # ================================================================
+            # PID CONTROLLERS
+            # ----------------------------------------------------------------
 
             # PITCH PID CONTROLLER
             K_VX_P = 1.5           # deg of corrective pitch per m/s of north-speed error
@@ -327,7 +411,7 @@ class Controller:
 
             pitch_des_raw = (K_VX_P * vx_err) + (K_VX_D * d_vx_err)
 
-            pitch_des = float(np.clip(pitch_des_raw, -PITCH_LIMIT, PITCH_LIMIT))
+            pitch_des = float(np.clip(pitch_des_raw, -PITCH_LIMIT, -20))
 
             K_P_pitch = 0.015
             K_D_pitch = 0.001
@@ -339,8 +423,8 @@ class Controller:
 
 
             # ROLL PID CONTROLLER
-            K_VY_P = 14.3         # Proportional: deg of tilt per m/s of error
-            K_VY_D = 6        
+            K_VY_P = 30         # Proportional: deg of tilt per m/s of error
+            K_VY_D = 7.25        
             ROLL_LIMIT = 50.0    # deg, max tilt
             
             vy_err = v_des_east - vy_world
@@ -352,19 +436,28 @@ class Controller:
             roll_des = float(np.clip(roll_des_raw, -ROLL_LIMIT, ROLL_LIMIT))
             
             K_P_roll = 0.015    # match pitch
-            K_D_roll = 0.001    # raised with K_P for damping
+            K_D_roll = 0.001025    # raised with K_P for damping
 
             err_roll = roll_des - roll_deg
 
             rollCommand = K_P_roll*err_roll  -  K_D_roll*roll_rate
 
 
+            # YAW PID
+            K_P_yaw = 0.03
+            K_D_yaw = 0.002
+
+            err_yaw = 180 - yaw_deg
+            err_yaw = (err_yaw + 180.0) % 360.0 - 180.0
+
+            yawCommand = K_P_yaw*err_yaw  -  K_D_yaw*yaw_rate
+
 
             # THRUST PID
-            thrust_trim = 0.26567  # experimentally determined, this is near correct +/- 0.0001
+            thrust_trim = 0.265  # experimentally determined, this is damn near correct +/- 0.0001
             
-            K_P_thrust = 0.07
-            K_D_thrust = 0.046
+            K_P_thrust = 0.0925
+            K_D_thrust = 0.05
 
             err_elev = elev_des - z_pos
 
@@ -382,8 +475,7 @@ class Controller:
 
 
 
-
-            self._send_attitude_rates(rollCommand, pitchCommand, 0.0, thrustCommand)
+            self._send_attitude_rates(rollCommand, pitchCommand, yawCommand, thrustCommand)
 
 
             time.sleep(1.0 / CONTROL_HZ)

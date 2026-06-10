@@ -174,6 +174,10 @@ class VisionRX:
             'bbox_w': bw, 'bbox_h': bh,
             'area':      cv2.contourArea(best),
             'frame_id':  frame_id,
+            'bx':        bx,
+            'by':        by,
+            'bw':        bw,
+            'bh':        bh
         }
 
         return cx, cy
