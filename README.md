@@ -39,9 +39,9 @@ All components run on separate threads and communicate through a single shared d
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                         shared_data (dict)                       │
+│                         shared_data (dict)                      │
 │  odometry · attitude · race_status · gates · imu · collision    │
-│  clock_offset_ns · armed · motor_feedback · vision_gate_estimate │
+│  clock_offset_ns · armed · motor_feedback · vision_gate_estimate│
 └─────────────────────────────────────────────────────────────────┘
         ▲                  ▲                        ▲
         │                  │                        │
@@ -273,8 +273,6 @@ rb_z = −rc_z·sin(20°) + rc_y·cos(20°)
 
 **5. Gate NED position.** The 3D range is projected along the world-frame ray and added to the drone's current NED position.
 
-If vision is unavailable (no detection in the current frame), the controller falls back to the MAVLink track data gate positions, which are provided in NED coordinates by the simulator at session start.
-
 ---
 
 ## Coordinate Frames
@@ -291,10 +289,8 @@ All MAVLink messages use NED. `SET_ATTITUDE_TARGET` quaternions are ZYX Euler co
 
 ## Known Simulator Behaviours
 
-- **`race_start_boot_time_ms`** is set to the sim clock value at the moment the user clicks Race in the UI. It does not include any countdown — the value is valid for GO immediately.
 - **Stale UDP packets** from previous sessions remain in the OS buffer after a restart. The controller guards against these by recording the sim clock at the moment it enters `WAIT_FOR_START` and rejecting any `race_start_boot_time_ms` that predates this anchor.
 - **Ground contact collisions** fire hundreds of times per second while the drone is on the pad before takeoff. The collision logger throttles output to one summary line per second.
-- **Z velocity setpoints** in `SET_POSITION_TARGET_LOCAL_NED` are ignored by the simulator's flight controller. Altitude must be controlled via the `thrust` field of `SET_ATTITUDE_TARGET`.
 
 ---
 
