@@ -57,6 +57,59 @@ DUMP_MAX_SETS    = 400     # stop dumping after this many sets (disk-flood guard
 INSTR_AREA_FLOOR = 100     # log/draw contours down to this area (below MIN_CONTOUR_AREA)
 
 
+def detect_gate(img):
+    """
+    Pure gate detection — the SINGLE SOURCE OF TRUTH for the perception pipeline.
+
+    Takes a BGR image and returns (estimate, mask, contours) where `estimate` is a
+    dict of geometric fields (or None if no gate found). `frame_id` is added by the
+    caller. Kept as a free function (no shared_data, no threads) so the offline
+    replay harness (cv_replay.py) can run the EXACT same detection as the live
+    VisionRX — so any threshold/param tuning done offline transfers to flight.
+
+    Convention: cx_offset > 0 = gate right of centre; cy_offset > 0 = gate below
+    centre (image Y-down).
+    """
+    hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+
+    # Red wraps the hue circle — combine both ranges
+    mask1 = cv2.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
+    mask2 = cv2.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
+    mask  = cv2.bitwise_or(mask1, mask2)
+
+    # Morphological clean-up
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    valid = [c for c in contours if cv2.contourArea(c) >= MIN_CONTOUR_AREA]
+    if not valid:
+        return None, mask, contours
+
+    best    = max(valid, key=cv2.contourArea)
+    moments = cv2.moments(best)
+    if moments['m00'] == 0.0:
+        return None, mask, contours
+
+    cx = moments['m10'] / moments['m00']
+    cy = moments['m01'] / moments['m00']
+    bx, by, bw, bh = cv2.boundingRect(best)
+
+    estimate = {
+        'cx':        cx,
+        'cy':        cy,
+        'cx_offset': cx - CX,
+        'cy_offset': cy - CY,
+        'bbox_x': bx, 'bbox_y': by,
+        'bbox_w': bw, 'bbox_h': bh,
+        'area':      cv2.contourArea(best),
+        'bx': bx, 'by': by, 'bw': bw, 'bh': bh,
+    }
+    return estimate, mask, contours
+
+
 class VisionRX:
 
     def __init__(self, data):
@@ -153,58 +206,21 @@ class VisionRX:
           cx_offset > 0  →  gate is to the RIGHT of image centre
           cy_offset > 0  →  gate is BELOW image centre  (image Y-down)
         """
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-
-        # Red wraps around the hue circle — combine both ranges
-        mask1 = cv2.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
-        mask2 = cv2.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
-        mask  = cv2.bitwise_or(mask1, mask2)
-
-        # Morphological clean-up: close gaps in the gate frame, remove noise
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
-        mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
-        mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
-
-        contours, _ = cv2.findContours(
-            mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-        )
+        # Detection logic lives in module-level detect_gate() so the offline replay
+        # harness runs the EXACT same pipeline (tuning transfers to flight).
+        estimate, mask, contours = detect_gate(img)
 
         # Diagnostics only — runs every frame, does not touch the published estimate.
         if INSTRUMENT:
             self._instrument(frame_id, img, mask, contours)
 
-        valid = [c for c in contours if cv2.contourArea(c) >= MIN_CONTOUR_AREA]
-        if not valid:
+        if estimate is None:
             self.data['vision_gate_estimate'] = None
             return None
 
-        best    = max(valid, key=cv2.contourArea)
-        moments = cv2.moments(best)
-        if moments['m00'] == 0.0:
-            self.data['vision_gate_estimate'] = None
-            return None
-
-        cx = moments['m10'] / moments['m00']
-        cy = moments['m01'] / moments['m00']
-
-        bx, by, bw, bh = cv2.boundingRect(best)
-
-        self.data['vision_gate_estimate'] = {
-            'cx':        cx,
-            'cy':        cy,
-            'cx_offset': cx - CX,   # positive = gate right of centre
-            'cy_offset': cy - CY,   # positive = gate below centre
-            'bbox_x': bx, 'bbox_y': by,
-            'bbox_w': bw, 'bbox_h': bh,
-            'area':      cv2.contourArea(best),
-            'frame_id':  frame_id,
-            'bx':        bx,
-            'by':        by,
-            'bw':        bw,
-            'bh':        bh
-        }
-
-        return cx, cy
+        estimate['frame_id'] = frame_id
+        self.data['vision_gate_estimate'] = estimate
+        return estimate['cx'], estimate['cy']
 
     # ------------------------------------------------------------------
     # Instrumentation (diagnostics only, no behaviour change)
