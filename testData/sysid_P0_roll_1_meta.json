@@ -1,0 +1,16 @@
+{
+  "regime_id": "P0",
+  "excite_axis": "roll",
+  "repetition": 1,
+  "theta0_deg": 0.0,
+  "phi0_deg": 0.0,
+  "T0_nominal": 0.265,
+  "control_hz": 100,
+  "settle_dur": 4.0,
+  "hold_dur": 3.0,
+  "excite_dur": 10.0,
+  "recovery_dur": 4.0,
+  "unit_3211": 0.35,
+  "amp_used": 0.12,
+  "notes": ""
+}
