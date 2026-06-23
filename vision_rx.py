@@ -35,6 +35,20 @@ UPPER_RED_2 = np.array([180, 255, 255])
 # Minimum contour area (px²) to be considered a gate detection
 MIN_CONTOUR_AREA = 800
 
+# --- Partial / edge-exit rejection -----------------------------------------
+# As the drone passes THROUGH a gate, the red frame breaks into a partial sliver
+# against an image edge (e.g. bw=45 in the top-left corner). That fragment is a
+# valid red contour but a GARBAGE geometry source: a clipped width gives a wildly
+# wrong pinhole range and an off-centre fragment back-projects to a phantom gate
+# tens of metres up/sideways (observed: a corner sliver -> range ~19 m -> a full-
+# thrust 18 m climb command right at the gate plane). We reject a detection whose
+# bbox touches a frame edge AND is OFF-CENTRE on that axis: a gate that legitimately
+# fills the frame on close approach touches edges too, but stays centred, so it is
+# kept; only the off-centre clipped slivers are dropped. Horizontal clipping
+# corrupts width->range; vertical clipping corrupts the vertical estimate.
+EDGE_MARGIN_PX     = 4      # bbox within this many px of a border = "touching" it
+CENTER_REJECT_FRAC = 0.25   # off-centre by more than this fraction of W/H = reject
+
 # Discard partially-received frames older than this many frame IDs
 FRAME_BUFFER_DEPTH = 10
 
@@ -96,6 +110,18 @@ def detect_gate(img):
     cx = moments['m10'] / moments['m00']
     cy = moments['m01'] / moments['m00']
     bx, by, bw, bh = cv2.boundingRect(best)
+
+    # Reject partial/edge-exit slivers (see EDGE_MARGIN_PX note above). Use the
+    # bbox centre (immune to hollow-contour centroid shift), matching how the
+    # controller derives the gate centre.
+    true_cx = bx + bw / 2.0
+    true_cy = by + bh / 2.0
+    touches_lr = (bx <= EDGE_MARGIN_PX) or (bx + bw >= IMG_W - EDGE_MARGIN_PX)
+    touches_tb = (by <= EDGE_MARGIN_PX) or (by + bh >= IMG_H - EDGE_MARGIN_PX)
+    off_centre_x = abs(true_cx - CX) > CENTER_REJECT_FRAC * IMG_W
+    off_centre_y = abs(true_cy - CY) > CENTER_REJECT_FRAC * IMG_H
+    if (touches_lr and off_centre_x) or (touches_tb and off_centre_y):
+        return None, mask, contours
 
     estimate = {
         'cx':        cx,
