@@ -119,6 +119,12 @@ class VisionRX:
         self._vlog       = None
         self._proc_count = 0
         self._dump_sets  = 0
+        # Clear last run's dumped frames so vision_dump/ always matches the
+        # freshly-rewritten vision_log.csv. Frame IDs restart at 0 each run, so
+        # leftover frames would silently bind to the WRONG run's pose and corrupt
+        # offline scoring (cv_score.py). Diagnostics-only; never affects detection.
+        if INSTRUMENT:
+            self._clear_dump_dir()
         self.thread     = threading.Thread(
             target=self._vision_loop,
             daemon=False
@@ -225,6 +231,30 @@ class VisionRX:
     # ------------------------------------------------------------------
     # Instrumentation (diagnostics only, no behaviour change)
     # ------------------------------------------------------------------
+
+    def _clear_dump_dir(self):
+        """
+        Delete prior runs' raw frames from DUMP_DIR at startup so the dump stays
+        self-consistent with this run's vision_log.csv (frame IDs restart at 0 each
+        run). Only removes our own '*_raw.jpg' artifacts. Wrapped so a filesystem
+        error can never stop the vision pipeline from starting.
+        """
+        try:
+            if not os.path.isdir(DUMP_DIR):
+                return
+            removed = 0
+            for name in os.listdir(DUMP_DIR):
+                if name.endswith('_raw.jpg'):
+                    try:
+                        os.remove(os.path.join(DUMP_DIR, name))
+                        removed += 1
+                    except OSError:
+                        pass
+            if removed:
+                print(f'[VISION-INSTR] cleared {removed} old raw frame(s) from '
+                      f'{DUMP_DIR}/', flush=True)
+        except Exception as e:
+            print(f'[VISION-INSTR] dump-clear non-fatal: {e}', flush=True)
 
     def _instrument(self, frame_id, img, mask, contours):
         """
