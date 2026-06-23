@@ -350,11 +350,27 @@ class Controller:
                 g_north = x_pos + (est_distance_3d * rw_x)
                 g_east = y_pos + (est_distance_3d * rw_y)
                 gate_pz = z_pos + (est_distance_3d * rw_z) + 1
-            
+
+                # Remember the last good vision target + reset the blind counter, so a
+                # brief detection dropout coasts on it instead of immediately going blind.
+                self._last_gate = (g_north, g_east, gate_pz)
+                self._blind = 0
+
             else:
-                g_north = 0
-                g_east = 0
-                gate_pz = -3
+                # BLIND BEHAVIOR (pure-CV). Do NOT target the origin: the old
+                # g=(0,0,-3) plus the 35 m/s north blast flew the drone clean off the
+                # map the instant it lost sight of a gate (it clipped gate, rotated off
+                # axis, never re-detected, blasted toward origin, over-angled). Instead:
+                # COAST toward the last seen gate for a short window (ride through brief
+                # dropouts), then HOLD position (target = current pose -> zero velocity
+                # setpoint) so it stays controllable until it re-acquires a gate.
+                self._blind = getattr(self, '_blind', 0) + 1
+                last = getattr(self, '_last_gate', None)
+                BLIND_HOLD_TICKS = 25      # ~0.5 s at 50 Hz: ride through brief dropouts
+                if last is not None and self._blind <= BLIND_HOLD_TICKS:
+                    g_north, g_east, gate_pz = last
+                else:
+                    g_north, g_east, gate_pz = x_pos, y_pos, z_pos
 
             # --- DIAG: capture the VISION-derived target before the telemetry override
             # so we can measure vision-localization accuracy against telemetry ground
