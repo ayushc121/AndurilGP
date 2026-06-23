@@ -255,19 +255,29 @@ class VisionRX:
                 fill = (cv2.countNonZero(roi) / float(w * h)) if (w and h) else 0.0
                 stats.append((area, x, y, w, h, ccx, ccy, aspect, fill))
 
+            # Drone pose at this frame — the one missing ingredient for offline
+            # auto-scoring (project a known gate's 3D NED position into this image and
+            # compare to the detection). Read lock-free; odometry is replaced wholesale
+            # so the snapshot is self-consistent. Pure diagnostics, no flight effect.
+            odo = self.data.get('odometry') or {}
+            pose = [odo.get('x'), odo.get('y'), odo.get('z'),
+                    odo.get('qw'), odo.get('qx'), odo.get('qy'), odo.get('qz')]
+            pose = ['' if v is None else f'{v:.5f}' for v in pose]
+
             if self._vlog is None:
                 self._vlog = open('vision_log.csv', 'w', buffering=1)
                 self._vlog.write('frame_id,n_contours,best_area,best_aspect,best_fill,'
                                  'best_cx,best_cy,best_cx_off,best_cy_off,'
-                                 'best_bx,best_by,best_bw,best_bh\n')
+                                 'best_bx,best_by,best_bw,best_bh,'
+                                 'dx,dy,dz,qw,qx,qy,qz\n')
             if stats:
                 area, x, y, w, h, ccx, ccy, aspect, fill = max(stats, key=lambda s: s[0])
-                self._vlog.write(
-                    f'{frame_id},{len(stats)},{area:.0f},{aspect:.3f},{fill:.3f},'
-                    f'{ccx:.1f},{ccy:.1f},{ccx - CX:.1f},{ccy - CY:.1f},'
-                    f'{x},{y},{w},{h}\n')
+                best = [frame_id, len(stats), f'{area:.0f}', f'{aspect:.3f}', f'{fill:.3f}',
+                        f'{ccx:.1f}', f'{ccy:.1f}', f'{ccx - CX:.1f}', f'{ccy - CY:.1f}',
+                        x, y, w, h]
             else:
-                self._vlog.write(f'{frame_id},0,,,,,,,,,,,\n')
+                best = [frame_id, 0, '', '', '', '', '', '', '', '', '', '', '']
+            self._vlog.write(','.join(str(v) for v in best + pose) + '\n')
 
             if (self._proc_count % DUMP_EVERY_N == 0
                     and self._dump_sets < DUMP_MAX_SETS):
