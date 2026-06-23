@@ -370,7 +370,11 @@ class Controller:
                 if last is not None and self._blind <= BLIND_HOLD_TICKS:
                     g_north, g_east, gate_pz = last
                 else:
-                    g_north, g_east, gate_pz = x_pos, y_pos, z_pos
+                    # HOLD current altitude too. elev_des = gate_pz - 0.8, so use
+                    # gate_pz = z_pos + 0.8 -> elev_des = z_pos. (Using z_pos here gave
+                    # elev_des = z_pos - 0.8, a perpetual 0.8 m climb that drifted the
+                    # drone 23 m up when it lost a gate while stopped.)
+                    g_north, g_east, gate_pz = x_pos, y_pos, z_pos + 0.8
 
             # --- DIAG: capture the VISION-derived target before the telemetry override
             # so we can measure vision-localization accuracy against telemetry ground
@@ -383,8 +387,13 @@ class Controller:
             telem_n = telem_e = telem_pz = float('nan')
 
             # ================================================================
-            # ODOMETRY BASED GATE TARGETING
+            # TELEMETRY GATE TARGET — LOGGING ONLY (PURE-CV: does NOT steer)
             # ----------------------------------------------------------------
+            # Phase 0: the drone navigates on VISION ONLY. The telemetry track
+            # packet is retained solely as a ground-truth ORACLE for nav_diag.csv
+            # (so we can measure how far the vision back-projection is from truth).
+            # It must NOT overwrite g_north/g_east/gate_pz — doing so silently flew
+            # the drone on telemetry and masked the real CV performance.
             if gates:
                 if gates is not getattr(self, '_gates_ref', None):
                     self._gates_ref = gates
@@ -396,12 +405,8 @@ class Controller:
                 if active_idx < len(gates):
                     ga = gates[active_idx]
 
-                    # Active gate in WORLD-NED (all axes + signs resolved & frozen above).
-                    g_north =  ga['pos_x']
-                    g_east  =  ga['pos_y']
-                    gate_pz =  ga['pos_z']
-
-                    # --- DIAG: record telemetry ground truth for the comparison log.
+                    # --- DIAG ONLY: record telemetry ground truth for the comparison
+                    # log. Intentionally does NOT touch g_north/g_east/gate_pz.
                     telem_present = True
                     telem_idx = active_idx
                     telem_n, telem_e, telem_pz = ga['pos_x'], ga['pos_y'], ga['pos_z']
@@ -411,8 +416,13 @@ class Controller:
             # DESIRED PATH GENERATION
             # ----------------------------------------------------------------
 
-            V_MAX     = 20.0     # m/s horizontal cap
-            K_POS     = 1.7     # m/s per m of horizontal error
+            # CHANGE B — slow-into-gate profile (accuracy first; speed optimized later).
+            # The old law floored north at 35 m/s (`35*sign(vec_n) + 0.15*...`), which
+            # crossed each gate's plane before the east/altitude loops could converge ->
+            # passed through 0 gates despite no collisions (misses 2-17 m).
+            V_MAX       = 8.0    # m/s horizontal cap (was 20; lowered for accuracy)
+            K_POS       = 1.7    # m/s per m of horizontal error (P slows as it nears)
+            ALIGN_SCALE = 4.0    # m of (east+vertical) miss that halves north speed
 
             v_des_north = 0.0           # setpoints default to hover / hold when no gate
             v_des_east  = 0.0
@@ -420,10 +430,17 @@ class Controller:
 
             vec_n = g_north - x_pos
             vec_e = g_east  - y_pos
+            vec_d = gate_pz - z_pos      # vertical miss to the gate (NED down)
 
-            # Horizontal velocity setpoints (P on position, capped -> auto-slow in).
-            v_des_north = 35 * np.sign(vec_n) + float(np.clip(K_POS * vec_n, -V_MAX, V_MAX)) * 0.15
+            # Proper P-on-position velocity setpoints, capped -> auto-slow into the gate.
+            v_des_north = float(np.clip(K_POS * vec_n, -V_MAX, V_MAX))
             v_des_east  = float(np.clip(K_POS * vec_e, -V_MAX, V_MAX))
+
+            # SLOW INTO THE GATE: scale north speed down while not yet aligned with the
+            # opening (lateral + vertical miss), so east & altitude CONVERGE before we
+            # cross the gate plane instead of blasting through. ~1 when aligned, ->0 far.
+            align = ALIGN_SCALE / (ALIGN_SCALE + abs(vec_e) + abs(vec_d))
+            v_des_north *= align
 
             # Altitude:
             elev_des = gate_pz - 0.8
@@ -456,7 +473,7 @@ class Controller:
             # PITCH PID CONTROLLER
             K_VX_P = 1.5           # deg of corrective pitch per m/s of north-speed error
             K_VX_D = 0
-            PITCH_LIMIT = 50.0   # deg, max tilt
+            PITCH_LIMIT = 30.0   # deg, max tilt (B: was 50; gentler for accuracy)
 
             vx_err = v_des_north - vx_world
             d_vx_err = (vx_err - self.prev_vx_err) / dt
@@ -465,7 +482,11 @@ class Controller:
 
             pitch_des_raw = (K_VX_P * vx_err) + (K_VX_D * d_vx_err)
 
-            pitch_des = float(np.clip(pitch_des_raw, -PITCH_LIMIT, -20))
+            # CHANGE B — relax the pitch clamp. It was clip(raw, -50, -20), forcing a
+            # permanent >=20 deg dive so the drone could never level or brake (it just
+            # "slammed the gas"). Symmetric clamp lets it pitch up to brake / slow into
+            # gates and hold altitude on the descent.
+            pitch_des = float(np.clip(pitch_des_raw, -PITCH_LIMIT, PITCH_LIMIT))
 
             K_P_pitch = 0.015
             K_D_pitch = 0.001
@@ -477,9 +498,13 @@ class Controller:
 
 
             # ROLL PID CONTROLLER
-            K_VY_P = 30         # Proportional: deg of tilt per m/s of error
-            K_VY_D = 7.25        
-            ROLL_LIMIT = 50.0    # deg, max tilt
+            # Tamed for deliberate flight: was K_VY_P=30, K_VY_D=7.25, LIMIT=50 -- a
+            # huge proportional gain and an enormous derivative gain on a noisy east
+            # setpoint produced violent left-right banking (tilted-horizon frames).
+            # Pitch works fine at K_VX_P=1.5; bring roll into the same regime.
+            K_VY_P = 3.0         # deg of tilt per m/s of east-velocity error (was 30)
+            K_VY_D = 0.5         # derivative (was 7.25 -> amplified noise into wobble)
+            ROLL_LIMIT = 25.0    # deg, max tilt (was 50)
             
             vy_err = v_des_east - vy_world
             d_vy_err = (vy_err - self.prev_vy_err) / dt
@@ -527,7 +552,25 @@ class Controller:
             
             thrustCommand = np.clip(thrustCommand, 0, 1)
 
-
+            # --- altitude / attitude log (diagnostics; no behaviour change) ----------
+            # Per-tick record of the attitude loops so the roll/pitch behaviour is
+            # visible offline (the previous altitude_log.csv was stale -- this controller
+            # never wrote it). Watch roll_deg vs roll_des to see the violent banking, and
+            # z vs elev_des for altitude tracking.
+            alt_csv = getattr(self, '_alt_csv', None)
+            if alt_csv is None:
+                alt_csv = open('altitude_log.csv', 'w', buffering=1)
+                alt_csv.write('tick,x,y,z,elev_des,vx_world,vy_world,vz_world,'
+                              'v_des_north,v_des_east,roll_deg,roll_des,'
+                              'pitch_deg,pitch_des,yaw_deg,'
+                              'rollCommand,pitchCommand,thrust\n')
+                self._alt_csv = alt_csv
+            alt_csv.write(
+                f'{self._tick},{x_pos:.3f},{y_pos:.3f},{z_pos:.3f},{elev_des:.3f},'
+                f'{vx_world:.3f},{vy_world:.3f},{vz_world:.3f},'
+                f'{v_des_north:.3f},{v_des_east:.3f},{roll_deg:.2f},{roll_des:.2f},'
+                f'{pitch_deg:.2f},{pitch_des:.2f},{yaw_deg:.2f},'
+                f'{rollCommand:.4f},{pitchCommand:.4f},{thrustCommand:.4f}\n')
 
             self._send_attitude_rates(rollCommand, pitchCommand, yawCommand, thrustCommand)
 
