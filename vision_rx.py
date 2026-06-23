@@ -1,3 +1,4 @@
+import os
 import socket
 import struct
 import threading
@@ -40,12 +41,31 @@ FRAME_BUFFER_DEPTH = 10
 # Socket timeout so the thread can notice is_running=False cleanly
 SOCKET_TIMEOUT_S = 1.0
 
+# --------------------------------------------------------------------------------------
+# INSTRUMENTATION (diagnostics only, no behaviour change). Captures what the camera
+# actually sees so detection can be evaluated against real frames + numbers. The
+# published vision_gate_estimate is UNCHANGED.
+#   * vision_dump/   : raw frame, HSV red mask, detection overlay, every N frames.
+#   * vision_log.csv : per-frame contour count + the largest contour's area/aspect/
+#                      fill_ratio/centroid/bbox (the metrics a shape filter would use).
+# Set INSTRUMENT = False to disable entirely.
+# --------------------------------------------------------------------------------------
+INSTRUMENT       = True
+DUMP_DIR         = 'vision_dump'
+DUMP_EVERY_N     = 15      # save the image trio every this many PROCESSED frames
+DUMP_MAX_SETS    = 400     # stop dumping after this many sets (disk-flood guard)
+INSTR_AREA_FLOOR = 100     # log/draw contours down to this area (below MIN_CONTOUR_AREA)
+
 
 class VisionRX:
 
     def __init__(self, data):
         self.data       = data
         self.is_running = True
+        # Instrumentation state (diagnostics only — does not affect detection output).
+        self._vlog       = None
+        self._proc_count = 0
+        self._dump_sets  = 0
         self.thread     = threading.Thread(
             target=self._vision_loop,
             daemon=False
@@ -149,6 +169,10 @@ class VisionRX:
             mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
         )
 
+        # Diagnostics only — runs every frame, does not touch the published estimate.
+        if INSTRUMENT:
+            self._instrument(frame_id, img, mask, contours)
+
         valid = [c for c in contours if cv2.contourArea(c) >= MIN_CONTOUR_AREA]
         if not valid:
             self.data['vision_gate_estimate'] = None
@@ -181,3 +205,73 @@ class VisionRX:
         }
 
         return cx, cy
+
+    # ------------------------------------------------------------------
+    # Instrumentation (diagnostics only, no behaviour change)
+    # ------------------------------------------------------------------
+
+    def _instrument(self, frame_id, img, mask, contours):
+        """
+        Record per-frame detection diagnostics so detection can be evaluated from real
+        data. Writes vision_log.csv (per-frame contour count + the largest contour's
+        area, aspect = bbox w/h, fill_ratio = red mask px / bbox area [hollow gate ->
+        low, solid blob -> high], centroid + offsets, bbox) and, every DUMP_EVERY_N
+        frames, an image trio to vision_dump/ (raw, HSV mask, overlay with all
+        above-floor contours + the largest bbox/centroid + image-centre cross).
+        Wrapped in try/except so a disk error can never kill the vision thread.
+        """
+        try:
+            self._proc_count += 1
+
+            stats = []
+            for c in contours:
+                area = cv2.contourArea(c)
+                if area < INSTR_AREA_FLOOR:
+                    continue
+                x, y, w, h = cv2.boundingRect(c)
+                m = cv2.moments(c)
+                if m['m00'] == 0.0:
+                    continue
+                ccx = m['m10'] / m['m00']
+                ccy = m['m01'] / m['m00']
+                aspect = (w / h) if h else 0.0
+                roi = mask[y:y + h, x:x + w]
+                fill = (cv2.countNonZero(roi) / float(w * h)) if (w and h) else 0.0
+                stats.append((area, x, y, w, h, ccx, ccy, aspect, fill))
+
+            if self._vlog is None:
+                self._vlog = open('vision_log.csv', 'w', buffering=1)
+                self._vlog.write('frame_id,n_contours,best_area,best_aspect,best_fill,'
+                                 'best_cx,best_cy,best_cx_off,best_cy_off,'
+                                 'best_bx,best_by,best_bw,best_bh\n')
+            if stats:
+                area, x, y, w, h, ccx, ccy, aspect, fill = max(stats, key=lambda s: s[0])
+                self._vlog.write(
+                    f'{frame_id},{len(stats)},{area:.0f},{aspect:.3f},{fill:.3f},'
+                    f'{ccx:.1f},{ccy:.1f},{ccx - CX:.1f},{ccy - CY:.1f},'
+                    f'{x},{y},{w},{h}\n')
+            else:
+                self._vlog.write(f'{frame_id},0,,,,,,,,,,,\n')
+
+            if (self._proc_count % DUMP_EVERY_N == 0
+                    and self._dump_sets < DUMP_MAX_SETS):
+                os.makedirs(DUMP_DIR, exist_ok=True)
+                tag = f'{frame_id:06d}'
+                cv2.imwrite(os.path.join(DUMP_DIR, f'{tag}_raw.jpg'), img)
+                cv2.imwrite(os.path.join(DUMP_DIR, f'{tag}_mask.png'), mask)
+                overlay = img.copy()
+                for (area, x, y, w, h, ccx, ccy, aspect, fill) in stats:
+                    cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 255, 0), 1)
+                if stats:
+                    area, x, y, w, h, ccx, ccy, aspect, fill = max(stats, key=lambda s: s[0])
+                    cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 0, 255), 2)
+                    cv2.circle(overlay, (int(ccx), int(ccy)), 4, (255, 0, 0), -1)
+                    cv2.putText(overlay, f'A{area:.0f} ar{aspect:.2f} f{fill:.2f}',
+                                (x, max(12, y - 4)), cv2.FONT_HERSHEY_SIMPLEX,
+                                0.4, (255, 255, 255), 1)
+                cv2.drawMarker(overlay, (int(CX), int(CY)), (0, 255, 255),
+                               cv2.MARKER_CROSS, 16, 1)
+                cv2.imwrite(os.path.join(DUMP_DIR, f'{tag}_overlay.jpg'), overlay)
+                self._dump_sets += 1
+        except Exception as e:
+            print(f'[VISION-INSTR] non-fatal: {e}', flush=True)
