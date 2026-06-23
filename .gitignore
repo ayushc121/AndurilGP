@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Generated diagnostic logs / artifacts (regenerated on every run)
+altitude_log.csv
+gate_log.csv
+gate_packets.csv
+nav_diag.csv
+vision_log.csv
+vision_dump/
+run.log

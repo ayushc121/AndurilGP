@@ -356,6 +356,16 @@ class Controller:
                 g_east = 0
                 gate_pz = -3
 
+            # --- DIAG: capture the VISION-derived target before the telemetry override
+            # so we can measure vision-localization accuracy against telemetry ground
+            # truth. Pure diagnostics; does not affect steering.
+            vision_present = vision is not None
+            g_north_vis, g_east_vis, gate_pz_vis = g_north, g_east, gate_pz
+            est_dist_vis = est_distance_3d if vision_present else float('nan')
+            telem_present = False
+            telem_idx = -1
+            telem_n = telem_e = telem_pz = float('nan')
+
             # ================================================================
             # ODOMETRY BASED GATE TARGETING
             # ----------------------------------------------------------------
@@ -374,6 +384,11 @@ class Controller:
                     g_north =  ga['pos_x']
                     g_east  =  ga['pos_y']
                     gate_pz =  ga['pos_z']
+
+                    # --- DIAG: record telemetry ground truth for the comparison log.
+                    telem_present = True
+                    telem_idx = active_idx
+                    telem_n, telem_e, telem_pz = ga['pos_x'], ga['pos_y'], ga['pos_z']
 
 
             # ================================================================
@@ -394,8 +409,28 @@ class Controller:
             v_des_north = 35 * np.sign(vec_n) + float(np.clip(K_POS * vec_n, -V_MAX, V_MAX)) * 0.15
             v_des_east  = float(np.clip(K_POS * vec_e, -V_MAX, V_MAX))
 
-            # Altitude: 
+            # Altitude:
             elev_des = gate_pz - 0.8
+
+            # --- DIAG: vision-vs-telemetry navigation log (no behaviour change). One
+            # row per tick: drone pose, the VISION-derived gate target, the TELEMETRY
+            # ground-truth target, presence flags, and the FINAL target actually used
+            # (telemetry overrides vision when present). On a steady approach to the
+            # same gate, vision (g_*_vis) should match telemetry (telem_*) within a few
+            # metres if the back-projection is trustworthy. nan = that source absent.
+            nav_csv = getattr(self, '_nav_csv', None)
+            if nav_csv is None:
+                nav_csv = open('nav_diag.csv', 'w', buffering=1)
+                nav_csv.write('tick,drone_x,drone_y,drone_z,yaw_deg,'
+                              'vision_present,est_dist_vis,gN_vis,gE_vis,gpz_vis,'
+                              'telem_present,telem_idx,telem_n,telem_e,telem_pz,'
+                              'gN_final,gE_final,gpz_final,vec_n,vec_e\n')
+                self._nav_csv = nav_csv
+            nav_csv.write(
+                f'{self._tick},{x_pos:.3f},{y_pos:.3f},{z_pos:.3f},{yaw_deg:.1f},'
+                f'{int(vision_present)},{est_dist_vis:.3f},{g_north_vis:.3f},{g_east_vis:.3f},{gate_pz_vis:.3f},'
+                f'{int(telem_present)},{telem_idx},{telem_n:.3f},{telem_e:.3f},{telem_pz:.3f},'
+                f'{g_north:.3f},{g_east:.3f},{gate_pz:.3f},{vec_n:.3f},{vec_e:.3f}\n')
 
             
             # ================================================================
