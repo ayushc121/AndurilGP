@@ -281,7 +281,7 @@ class Controller:
             # ================================================================
             # VISUAL BASED GATE TARGETING
             # ----------------------------------------------------------------
-            vision = self.data.get('vision_gate_estimate')    
+            vision = self.data.get('vision_gate_estimate')
 
             if vision is not None:
                 # ==========================================
@@ -355,6 +355,7 @@ class Controller:
                 # brief detection dropout coasts on it instead of immediately going blind.
                 self._last_gate = (g_north, g_east, gate_pz)
                 self._blind = 0
+                self._acquiring = False   # have a gate -> APPROACH, not acquiring
 
             else:
                 # BLIND BEHAVIOR (pure-CV). Do NOT target the origin: the old
@@ -366,14 +367,24 @@ class Controller:
                 # setpoint) so it stays controllable until it re-acquires a gate.
                 self._blind = getattr(self, '_blind', 0) + 1
                 last = getattr(self, '_last_gate', None)
-                BLIND_HOLD_TICKS = 25      # ~0.5 s at 50 Hz: ride through brief dropouts
+                BLIND_HOLD_TICKS  = 25     # ~0.5 s at 50 Hz: ride through brief dropouts
+                ACQUIRE_MAX_TICKS = 150    # ~3 s of active search before giving up
+                self._acquiring = False
                 if last is not None and self._blind <= BLIND_HOLD_TICKS:
+                    # Brief dropout: coast on the last good gate target.
                     g_north, g_east, gate_pz = last
+                elif self._blind <= BLIND_HOLD_TICKS + ACQUIRE_MAX_TICKS:
+                    # ACQUIRE (Phase 3): the next gate sits BELOW the 20°-up camera on
+                    # the descending course (offline sweep: 12-17° below horizon ->
+                    # py>360, out the bottom). HOLD altitude + no lateral, and let the
+                    # pitch section force a nose-down camera aim so the lower gate rises
+                    # into frame; the resulting forward glide closes on it. As soon as a
+                    # gate is detected the vision branch takes over and brakes/descends.
+                    g_north, g_east, gate_pz = x_pos, y_pos, z_pos + 0.8
+                    self._acquiring = True
                 else:
-                    # HOLD current altitude too. elev_des = gate_pz - 0.8, so use
-                    # gate_pz = z_pos + 0.8 -> elev_des = z_pos. (Using z_pos here gave
-                    # elev_des = z_pos - 0.8, a perpetual 0.8 m climb that drifted the
-                    # drone 23 m up when it lost a gate while stopped.)
+                    # Searched long enough with no gate -> HOLD (level + brake) so a
+                    # failed search can't fly the drone off the map.
                     g_north, g_east, gate_pz = x_pos, y_pos, z_pos + 0.8
 
             # --- DIAG: capture the VISION-derived target before the telemetry override
@@ -488,6 +499,18 @@ class Controller:
             # gates and hold altitude on the descent.
             pitch_des = float(np.clip(pitch_des_raw, -PITCH_LIMIT, PITCH_LIMIT))
 
+            # PHASE 3 — camera-aim during ACQUIRE. The velocity loop alone re-levels at
+            # cruise (vx_err->0), pointing the 20°-up camera back above the descending
+            # course so the next (lower) gate never enters frame. While acquiring, force
+            # at least AIM_PITCH_DEG of nose-down (negative = nose down) so the camera
+            # looks down-forward; the offline sweep shows ~-15° brings every next gate
+            # into frame (py 249-311 vs 382-423 at level). min() = "at least this much
+            # nose-down" regardless of the velocity term. Bounded by ACQUIRE_MAX_TICKS.
+            AIM_PITCH_DEG = -15.0
+            if getattr(self, '_acquiring', False):
+                pitch_des = float(np.clip(min(pitch_des_raw, AIM_PITCH_DEG),
+                                          -PITCH_LIMIT, PITCH_LIMIT))
+
             K_P_pitch = 0.015
             K_D_pitch = 0.001
 
@@ -563,14 +586,15 @@ class Controller:
                 alt_csv.write('tick,x,y,z,elev_des,vx_world,vy_world,vz_world,'
                               'v_des_north,v_des_east,roll_deg,roll_des,'
                               'pitch_deg,pitch_des,yaw_deg,'
-                              'rollCommand,pitchCommand,thrust\n')
+                              'rollCommand,pitchCommand,thrust,acq\n')
                 self._alt_csv = alt_csv
             alt_csv.write(
                 f'{self._tick},{x_pos:.3f},{y_pos:.3f},{z_pos:.3f},{elev_des:.3f},'
                 f'{vx_world:.3f},{vy_world:.3f},{vz_world:.3f},'
                 f'{v_des_north:.3f},{v_des_east:.3f},{roll_deg:.2f},{roll_des:.2f},'
                 f'{pitch_deg:.2f},{pitch_des:.2f},{yaw_deg:.2f},'
-                f'{rollCommand:.4f},{pitchCommand:.4f},{thrustCommand:.4f}\n')
+                f'{rollCommand:.4f},{pitchCommand:.4f},{thrustCommand:.4f},'
+                f'{int(getattr(self, "_acquiring", False))}\n')
 
             self._send_attitude_rates(rollCommand, pitchCommand, yawCommand, thrustCommand)
 
