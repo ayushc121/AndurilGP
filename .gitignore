@@ -14,6 +14,8 @@ run.log
 # Offline replay-harness outputs (regenerated each run)
 vision_replay/
 cv_replay.csv
+cv_score.csv
 
 # Personal reference notes (intentionally untracked)
 DESIGN_NOTES.md
+HANDOFF.md
