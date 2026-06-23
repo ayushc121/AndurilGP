@@ -10,3 +10,10 @@ nav_diag.csv
 vision_log.csv
 vision_dump/
 run.log
+
+# Offline replay-harness outputs (regenerated each run)
+vision_replay/
+cv_replay.csv
+
+# Personal reference notes (intentionally untracked)
+DESIGN_NOTES.md
