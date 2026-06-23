@@ -282,22 +282,10 @@ class VisionRX:
             if (self._proc_count % DUMP_EVERY_N == 0
                     and self._dump_sets < DUMP_MAX_SETS):
                 os.makedirs(DUMP_DIR, exist_ok=True)
-                tag = f'{frame_id:06d}'
-                cv2.imwrite(os.path.join(DUMP_DIR, f'{tag}_raw.jpg'), img)
-                cv2.imwrite(os.path.join(DUMP_DIR, f'{tag}_mask.png'), mask)
-                overlay = img.copy()
-                for (area, x, y, w, h, ccx, ccy, aspect, fill) in stats:
-                    cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 255, 0), 1)
-                if stats:
-                    area, x, y, w, h, ccx, ccy, aspect, fill = max(stats, key=lambda s: s[0])
-                    cv2.rectangle(overlay, (x, y), (x + w, y + h), (0, 0, 255), 2)
-                    cv2.circle(overlay, (int(ccx), int(ccy)), 4, (255, 0, 0), -1)
-                    cv2.putText(overlay, f'A{area:.0f} ar{aspect:.2f} f{fill:.2f}',
-                                (x, max(12, y - 4)), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.4, (255, 255, 255), 1)
-                cv2.drawMarker(overlay, (int(CX), int(CY)), (0, 255, 255),
-                               cv2.MARKER_CROSS, 16, 1)
-                cv2.imwrite(os.path.join(DUMP_DIR, f'{tag}_overlay.jpg'), overlay)
+                # Dump RAW frames only. Masks/overlays are fully regenerable offline
+                # from raw via cv_replay.py, so writing them during flight is wasted
+                # I/O and clutter (and needed manual cleanup). Raw is the source data.
+                cv2.imwrite(os.path.join(DUMP_DIR, f'{frame_id:06d}_raw.jpg'), img)
                 self._dump_sets += 1
         except Exception as e:
             print(f'[VISION-INSTR] non-fatal: {e}', flush=True)
