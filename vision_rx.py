@@ -49,6 +49,10 @@ MIN_CONTOUR_AREA = 800
 EDGE_MARGIN_PX     = 4      # bbox within this many px of a border = "touching" it
 CENTER_REJECT_FRAC = 0.25   # off-centre by more than this fraction of W/H = reject
 
+# A real-but-weak gate hint (small/far/low) usable for visual-servo descent but not
+# trusted for back-projection steering (which needs MIN_CONTOUR_AREA + not clipped).
+SERVO_AREA_FLOOR   = 300
+
 # Discard partially-received frames older than this many frame IDs
 FRAME_BUFFER_DEPTH = 10
 
@@ -98,7 +102,13 @@ def detect_gate(img):
 
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    valid = [c for c in contours if cv2.contourArea(c) >= MIN_CONTOUR_AREA]
+    # Two-tier candidate set. SERVO_AREA_FLOOR catches a small/far gate low in the
+    # frame so the controller can VISUAL-SERVO descend toward it (the descending
+    # course drops the next gate below the 20°-up camera, where it shows only as a
+    # weak/clipped band). MIN_CONTOUR_AREA marks a detection big enough to TRUST for
+    # back-projection steering. Red mask is clean (only gates are red) so a small red
+    # blob is almost certainly a real far gate, not noise.
+    valid = [c for c in contours if cv2.contourArea(c) >= SERVO_AREA_FLOOR]
     if not valid:
         return None, mask, contours
 
@@ -110,18 +120,29 @@ def detect_gate(img):
     cx = moments['m10'] / moments['m00']
     cy = moments['m01'] / moments['m00']
     bx, by, bw, bh = cv2.boundingRect(best)
+    area = cv2.contourArea(best)
 
-    # Reject partial/edge-exit slivers (see EDGE_MARGIN_PX note above). Use the
-    # bbox centre (immune to hollow-contour centroid shift), matching how the
-    # controller derives the gate centre.
+    # Edge / off-centre analysis (bbox centre = immune to hollow-contour centroid shift).
     true_cx = bx + bw / 2.0
     true_cy = by + bh / 2.0
     touches_lr = (bx <= EDGE_MARGIN_PX) or (bx + bw >= IMG_W - EDGE_MARGIN_PX)
     touches_tb = (by <= EDGE_MARGIN_PX) or (by + bh >= IMG_H - EDGE_MARGIN_PX)
     off_centre_x = abs(true_cx - CX) > CENTER_REJECT_FRAC * IMG_W
     off_centre_y = abs(true_cy - CY) > CENTER_REJECT_FRAC * IMG_H
-    if (touches_lr and off_centre_x) or (touches_tb and off_centre_y):
+
+    # HARD reject only the horizontal exit-sliver garbage (gate breaking off to one
+    # side as the drone passes THROUGH): clipped L/R AND off-centre horizontally. Its
+    # width->range is wild and it is neither steerable nor a useful descend hint (it
+    # caused the 18 m climb). Everything else is returned.
+    if touches_lr and off_centre_x:
         return None, mask, contours
+
+    # RELIABLE = big enough to trust for back-projection AND not a low/clipped band.
+    # A centred gate that fills the frame on close approach touches edges but stays
+    # centred -> still reliable. A low gate clipped at the bottom (touches T/B AND
+    # off-centre vertically) is a WEAK hint: real, but its size/centre are unreliable
+    # for ranging -> use it only to servo-descend, not to steer.
+    reliable = (area >= MIN_CONTOUR_AREA) and not (touches_tb and off_centre_y)
 
     estimate = {
         'cx':        cx,
@@ -130,8 +151,9 @@ def detect_gate(img):
         'cy_offset': cy - CY,
         'bbox_x': bx, 'bbox_y': by,
         'bbox_w': bw, 'bbox_h': bh,
-        'area':      cv2.contourArea(best),
+        'area':      area,
         'bx': bx, 'by': by, 'bw': bw, 'bh': bh,
+        'reliable':  reliable,
     }
     return estimate, mask, contours
 
