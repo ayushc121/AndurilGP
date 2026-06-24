@@ -125,6 +125,64 @@ class Controller:
         )
 
     # ------------------------------------------------------------------
+    # Vision geometry
+    # ------------------------------------------------------------------
+
+    def _gate_world_direction(self, true_cx, true_cy, roll_deg, pitch_deg, yaw_deg):
+        """
+        Unit vector in NED world frame pointing from the drone toward the gate,
+        derived from the gate's pixel position + the current attitude. It depends
+        only on BEARING (pixel offset + attitude), NOT on the gate's apparent
+        width -> it is trustworthy even for a weak/clipped detection whose
+        width->range estimate is not. Camera is tilted 20° UP from the body frame.
+
+        This is the single source of "which way is the gate"; the caller scales it
+        by the true range (reliable detection) or a fixed look-ahead (weak hint).
+        Generalizes to a gate in ANY direction (up/down/left/right) — there is no
+        descend-only or straight-ahead assumption.
+        """
+        FX = 320.0
+        CX = 320.0
+        CY = 180.0
+
+        # Pixel vector in camera frame, normalized to a pure direction.
+        vc_x = true_cx - CX
+        vc_y = true_cy - CY
+        vc_z = FX
+        ray_norm = math.sqrt(vc_x * vc_x + vc_y * vc_y + vc_z * vc_z)
+        rc_x = vc_x / ray_norm
+        rc_y = vc_y / ray_norm
+        rc_z = vc_z / ray_norm
+
+        # Camera -> body (apply +20° camera tilt).
+        tilt_rad = math.radians(20.0)
+        ctilt = math.cos(tilt_rad); stilt = math.sin(tilt_rad)
+        rb_x = rc_z * ctilt + rc_y * stilt
+        rb_y = rc_x
+        rb_z = -rc_z * stilt + rc_y * ctilt
+
+        # Body -> NED world (roll, then pitch, then yaw).
+        phi = math.radians(roll_deg)
+        theta = math.radians(pitch_deg)
+        psi = math.radians(yaw_deg)
+        c_phi = math.cos(phi); s_phi = math.sin(phi)
+        c_the = math.cos(theta); s_the = math.sin(theta)
+        c_psi = math.cos(psi); s_psi = math.sin(psi)
+
+        r1_x = rb_x
+        r1_y = rb_y * c_phi - rb_z * s_phi
+        r1_z = rb_y * s_phi + rb_z * c_phi
+
+        r2_x = r1_x * c_the + r1_z * s_the
+        r2_y = r1_y
+        r2_z = -r1_x * s_the + r1_z * c_the
+
+        rw_x = r2_x * c_psi - r2_y * s_psi
+        rw_y = r2_x * s_psi + r2_y * c_psi
+        rw_z = r2_z
+        return rw_x, rw_y, rw_z
+
+    # ------------------------------------------------------------------
     # Main update — called at CONTROL_HZ from main loop
     # ------------------------------------------------------------------
 
@@ -282,80 +340,56 @@ class Controller:
             # VISUAL BASED GATE TARGETING
             # ----------------------------------------------------------------
             vision = self.data.get('vision_gate_estimate')
+            est_distance_3d = float('nan')   # set only by the reliable back-projection
 
             if vision is not None:
                 # ==========================================
-                # SLAM - CONTINUOUS MAPPING
-                # ==========================================
+                # STEER TOWARD THE GATE ALONG ITS MEASURED BEARING
+                # ------------------------------------------------------------------
+                # Same logic for a strong or a weak detection: aim the target at a
+                # point along the gate's bearing (pixel + attitude -> world unit
+                # vector, reliable regardless of apparent width). The ONLY difference
+                # is how far along that bearing we place the target:
+                #   reliable  -> the true range from the known gate width (2.7 m).
+                #   weak hint -> a fixed look-ahead (range from a clipped/small blob
+                #                is untrustworthy; the BEARING still steers us toward
+                #                it laterally + vertically until it grows reliable).
+                # No descend-only / straight-ahead assumption -> generalizes to a gate
+                # in any position. Forward, lateral AND vertical are all steered, which
+                # is what was missing (frozen lateral wedged the drone into gate 2).
                 FX = 320.0
-                FY = 320.0
                 CX = 320.0
                 CY = 180.0
-                
-                # 1. True Center (Immune to hollow-contour centroid shifting)
+
                 true_cx = vision['bx'] + (vision['bw'] / 2.0)
                 true_cy = vision['by'] + (vision['bh'] / 2.0)
 
-                # Pixel vector in Camera Frame
+                rw_x, rw_y, rw_z = self._gate_world_direction(
+                    true_cx, true_cy, roll_deg, pitch_deg, yaw_deg)
+
+                # Range from the known gate width (2.7 m) via pin-hole, scaled to the
+                # full 3D ray length (= 2.7 * |ray| / bbox_w). This is valid for ANY
+                # detection that is not HORIZONTALLY clipped (those are rejected to None
+                # upstream) -- vertical clipping/low gates keep a full width, so the
+                # range is still good. Using it CONTINUOUSLY (incl. weak hints) avoids
+                # the target-jump that a fixed look-ahead caused whenever a detection
+                # flickered reliable<->weak (range snapping 10 m <-> true): that jump
+                # wobbled the drone at the start and flip-flopped it into gate 1.
                 vc_x = true_cx - CX
                 vc_y = true_cy - CY
-                vc_z = FX 
+                ray_norm = math.sqrt(vc_x * vc_x + vc_y * vc_y + FX * FX)
+                est_distance_3d = 2.7 * ray_norm / vision['bw']
 
-                # 2. Exact Distance using Width (Immune to camera pitch distortion)
-                # Real width of gate is 2.7m. Pin-hole horizontal distance:
-                z_dist_cam = (2.7 * FX) / vision['bw']
-                
-                # Scale it out to the full 3D hypotenuse ray length
-                ray_norm = math.sqrt(vc_x**2 + vc_y**2 + vc_z**2)
-                est_distance_3d = z_dist_cam * (ray_norm / vc_z)
-
-                # Normalize the pixel vector for pure rotation
-                rc_x = vc_x / ray_norm
-                rc_y = vc_y / ray_norm
-                rc_z = vc_z / ray_norm
-
-                # 3. Rotate to Body Frame (Apply +20 deg camera tilt)
-                tilt_rad = math.radians(20.0)
-                ctilt = math.cos(tilt_rad); stilt = math.sin(tilt_rad)
-                
-                rb_x = rc_z * ctilt + rc_y * stilt
-                rb_y = rc_x
-                rb_z = -rc_z * stilt + rc_y * ctilt
-
-                # 4. Rotate to NED World Frame using Drone IMU
-                phi = math.radians(roll_deg)
-                theta = math.radians(pitch_deg)
-                psi = math.radians(yaw_deg)
-
-                c_phi = math.cos(phi); s_phi = math.sin(phi)
-                c_the = math.cos(theta); s_the = math.sin(theta)
-                c_psi = math.cos(psi); s_psi = math.sin(psi)
-
-                # Roll (X-axis)
-                r1_x = rb_x
-                r1_y = rb_y * c_phi - rb_z * s_phi
-                r1_z = rb_y * s_phi + rb_z * c_phi
-
-                # Pitch (Y-axis)
-                r2_x = r1_x * c_the + r1_z * s_the
-                r2_y = r1_y
-                r2_z = -r1_x * s_the + r1_z * c_the
-
-                # Yaw (Z-axis) - This yields the final normalized World Vector
-                rw_x = r2_x * c_psi - r2_y * s_psi
-                rw_y = r2_x * s_psi + r2_y * c_psi
-                rw_z = r2_z
-
-                # 5. Apply strictly to map coordinates
                 g_north = x_pos + (est_distance_3d * rw_x)
-                g_east = y_pos + (est_distance_3d * rw_y)
+                g_east  = y_pos + (est_distance_3d * rw_y)
                 gate_pz = z_pos + (est_distance_3d * rw_z) + 1
+                self._servo = not vision.get('reliable', True)   # diagnostics/log only
 
                 # Remember the last good vision target + reset the blind counter, so a
                 # brief detection dropout coasts on it instead of immediately going blind.
                 self._last_gate = (g_north, g_east, gate_pz)
                 self._blind = 0
-                self._acquiring = False   # have a gate -> APPROACH, not acquiring
+                self._acquiring = False   # have a gate -> steering to it, not acquiring
 
             else:
                 # BLIND BEHAVIOR (pure-CV). Do NOT target the origin: the old
@@ -370,6 +404,7 @@ class Controller:
                 BLIND_HOLD_TICKS  = 25     # ~0.5 s at 50 Hz: ride through brief dropouts
                 ACQUIRE_MAX_TICKS = 150    # ~3 s of active search before giving up
                 self._acquiring = False
+                self._servo = False
                 if last is not None and self._blind <= BLIND_HOLD_TICKS:
                     # Brief dropout: coast on the last good gate target.
                     g_north, g_east, gate_pz = last
@@ -433,7 +468,7 @@ class Controller:
             # passed through 0 gates despite no collisions (misses 2-17 m).
             V_MAX       = 8.0    # m/s horizontal cap (was 20; lowered for accuracy)
             K_POS       = 1.7    # m/s per m of horizontal error (P slows as it nears)
-            ALIGN_SCALE = 4.0    # m of (east+vertical) miss that halves north speed
+            ALIGN_SCALE = 4.0    # m of LATERAL miss that halves north speed
 
             v_des_north = 0.0           # setpoints default to hover / hold when no gate
             v_des_east  = 0.0
@@ -447,10 +482,14 @@ class Controller:
             v_des_north = float(np.clip(K_POS * vec_n, -V_MAX, V_MAX))
             v_des_east  = float(np.clip(K_POS * vec_e, -V_MAX, V_MAX))
 
-            # SLOW INTO THE GATE: scale north speed down while not yet aligned with the
-            # opening (lateral + vertical miss), so east & altitude CONVERGE before we
-            # cross the gate plane instead of blasting through. ~1 when aligned, ->0 far.
-            align = ALIGN_SCALE / (ALIGN_SCALE + abs(vec_e) + abs(vec_d))
+            # SLOW INTO THE GATE: scale north speed down while not yet aligned LATERALLY
+            # with the opening, so east CONVERGES before we cross the gate plane.
+            # NOTE: the vertical miss (vec_d) was intentionally REMOVED from this throttle.
+            # Including it zeroed forward speed whenever the gate was below -> the drone
+            # dropped in place then crept forward ("flappy bird") on the descending
+            # course. Vertical is handled separately by elev_des/thrust, so dropping it
+            # here lets the drone descend WHILE flying forward (smooth diagonal glide).
+            align = ALIGN_SCALE / (ALIGN_SCALE + abs(vec_e))
             v_des_north *= align
 
             # Altitude:
@@ -586,7 +625,7 @@ class Controller:
                 alt_csv.write('tick,x,y,z,elev_des,vx_world,vy_world,vz_world,'
                               'v_des_north,v_des_east,roll_deg,roll_des,'
                               'pitch_deg,pitch_des,yaw_deg,'
-                              'rollCommand,pitchCommand,thrust,acq\n')
+                              'rollCommand,pitchCommand,thrust,acq,srv\n')
                 self._alt_csv = alt_csv
             alt_csv.write(
                 f'{self._tick},{x_pos:.3f},{y_pos:.3f},{z_pos:.3f},{elev_des:.3f},'
@@ -594,7 +633,8 @@ class Controller:
                 f'{v_des_north:.3f},{v_des_east:.3f},{roll_deg:.2f},{roll_des:.2f},'
                 f'{pitch_deg:.2f},{pitch_des:.2f},{yaw_deg:.2f},'
                 f'{rollCommand:.4f},{pitchCommand:.4f},{thrustCommand:.4f},'
-                f'{int(getattr(self, "_acquiring", False))}\n')
+                f'{int(getattr(self, "_acquiring", False))},'
+                f'{int(getattr(self, "_servo", False))}\n')
 
             self._send_attitude_rates(rollCommand, pitchCommand, yawCommand, thrustCommand)
 
