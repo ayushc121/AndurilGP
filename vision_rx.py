@@ -53,6 +53,15 @@ CENTER_REJECT_FRAC = 0.25   # off-centre by more than this fraction of W/H = rej
 # trusted for back-projection steering (which needs MIN_CONTOUR_AREA + not clipped).
 SERVO_AREA_FLOOR   = 300
 
+# --- Temporal smoothing (EMA) of the published gate estimate -------------------
+# The per-frame bbox jitters, and that jitter feeds the controller's lateral/altitude
+# wander. An exponential moving average steadies the "middle point" the controller
+# chases. Reset on a detection gap or a big discontinuity (gate switch) so two
+# different gates are never blended together.
+EMA_ALPHA     = 0.5    # weight of the newest frame (1.0 = no smoothing)
+EMA_RESET_DCX = 120    # px centre jump -> treat as a new gate, reset (no smoothing)
+EMA_RESET_WR  = 1.6    # bbox-width ratio (new/prev) beyond this -> reset
+
 # Discard partially-received frames older than this many frame IDs
 FRAME_BUFFER_DEPTH = 10
 
@@ -158,6 +167,40 @@ def detect_gate(img):
     return estimate, mask, contours
 
 
+def ema_smooth(prev_bbox, estimate, alpha=EMA_ALPHA):
+    """
+    Temporally smooth the gate bbox. `prev_bbox` is the previous SMOOTHED
+    (bx,by,bw,bh) or None; `estimate` is the current detect_gate() output (or None).
+    Returns (smoothed_estimate, new_prev_bbox).
+
+    Pure function (no instance state) so the live VisionRX and any offline replay
+    smooth IDENTICALLY. Resets — returns the raw frame untouched — on a detection gap
+    (estimate None) or a big jump (centre or width), so a gate SWITCH (pass one gate,
+    acquire the next) is never blended into a phantom in-between gate.
+    """
+    if estimate is None:
+        return None, None
+    cur = (estimate['bx'], estimate['by'], estimate['bw'], estimate['bh'])
+    if prev_bbox is None:
+        sm = cur
+    else:
+        ccx = cur[0] + cur[2] / 2.0
+        pcx = prev_bbox[0] + prev_bbox[2] / 2.0
+        wr = (cur[2] / prev_bbox[2]) if prev_bbox[2] else 99.0
+        if abs(ccx - pcx) > EMA_RESET_DCX or wr > EMA_RESET_WR or wr < 1.0 / EMA_RESET_WR:
+            sm = cur                                  # discontinuity -> reset (new gate)
+        else:
+            sm = tuple(alpha * c + (1.0 - alpha) * p for c, p in zip(cur, prev_bbox))
+    bx, by, bw, bh = sm
+    out = dict(estimate)
+    out['bx'], out['by'], out['bw'], out['bh'] = bx, by, bw, bh
+    out['cx'] = bx + bw / 2.0
+    out['cy'] = by + bh / 2.0
+    out['cx_offset'] = out['cx'] - CX
+    out['cy_offset'] = out['cy'] - CY
+    return out, sm
+
+
 class VisionRX:
 
     def __init__(self, data):
@@ -167,6 +210,7 @@ class VisionRX:
         self._vlog       = None
         self._proc_count = 0
         self._dump_sets  = 0
+        self._ema_prev   = None     # previous smoothed bbox (EMA state)
         # Clear last run's dumped frames so vision_dump/ always matches the
         # freshly-rewritten vision_log.csv. Frame IDs restart at 0 each run, so
         # leftover frames would silently bind to the WRONG run's pose and corrupt
@@ -264,9 +308,15 @@ class VisionRX:
         # harness runs the EXACT same pipeline (tuning transfers to flight).
         estimate, mask, contours = detect_gate(img)
 
-        # Diagnostics only — runs every frame, does not touch the published estimate.
+        # Diagnostics only — runs every frame, does not touch the raw detection.
         if INSTRUMENT:
             self._instrument(frame_id, img, mask, contours)
+
+        # Temporal smoothing of the PUBLISHED estimate (steadies the gate centre the
+        # controller chases). State on the instance; ema_smooth resets it on gaps /
+        # gate-switches. Instrumentation above logs the RAW detection, so offline
+        # scoring still sees unsmoothed detections.
+        estimate, self._ema_prev = ema_smooth(self._ema_prev, estimate)
 
         if estimate is None:
             self.data['vision_gate_estimate'] = None
