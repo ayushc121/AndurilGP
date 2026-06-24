@@ -15,6 +15,7 @@ run.log
 vision_replay/
 cv_replay.csv
 cv_score.csv
+flight_plot.png
 
 # Personal reference notes (intentionally untracked)
 DESIGN_NOTES.md
