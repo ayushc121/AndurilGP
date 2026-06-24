@@ -49,14 +49,13 @@ import numpy as np
 # =============================================================================
 # TEST CONFIGURATION — the ONLY section you edit between runs
 # =============================================================================
-REGIME_ID    = 'P1'       # P0 P1 P2 P3 P4 P5  B1 B2 B3  C1 C2
-EXCITE_AXIS  = 'roll'     # roll | pitch | yaw | heave | drop
+REGIME_ID    = 'P1'       # P0 P1 P2 P3 P4 P5  B1 B2 B3  C1 C2 D1
+EXCITE_AXIS  = 'yaw'     # roll | pitch | yaw | heave | drop
 REPETITION   = 1          # increment for repeat runs of the same test
 
 # Target trim angles (degrees).  Use the table in the plan doc.
 THETA0_DEG   =   -20.0      # target pitch  (negative = nose-down / forward)
 PHI0_DEG     =   0.0      # target roll   (positive = right-wing-down)
-T0_NOMINAL   =   0.265    # baseline hover thrust at this trim (before tilt comp) - DO NOT CHANGE
 
 NOTES        = ''         # optional free-text annotation saved in metadata JSON
 # =============================================================================
@@ -83,6 +82,15 @@ KEY_X='x'; KEY_Y='y'; KEY_Z='z'
 KEY_VX='vx'; KEY_VY='vy'; KEY_VZ='vz'     # body-frame direct
 KEY_P='rollspeed'; KEY_Q='pitchspeed'; KEY_R='yawspeed'
 KEY_AX='xacc'; KEY_AY='yacc'; KEY_AZ='zacc'
+
+# ── Altitude buffer ───────────────────────────────────────────────────────────
+# During the settle phase the drone climbs to this height above its spawn point
+# before beginning the hold/excitation phases. Gives vertical margin for
+# attitude excursions that temporarily reduce effective vertical thrust.
+# Increase for high-angle regimes (P3-P5) where excursions are larger.
+ALTITUDE_BUFFER_M = 10.0    # metres to climb above spawn Z before proceeding
+KP_ALT  = 0.10             # thrust delta per metre of altitude error
+KD_ALT  = 0.05             # thrust delta per (m/s) of vertical body velocity
 
 # ── Timing ────────────────────────────────────────────────────────────────────
 CONTROL_HZ    = 100
@@ -147,14 +155,19 @@ def _3211(t_local):
 # =============================================================================
 # Helper: tilt-compensated thrust
 # =============================================================================
-def _tilt_thrust(base_thrust, phi, theta, w_b):
+THRUST_HOVER = 0.265   # physical hover trim constant — never changes
+
+def _tilt_thrust(qx, qy, w_b=0.0):
     """
-    Compensates thrust command for drone tilt so altitude is maintained.
-    Also adds a small w_b damping term.
+    Quaternion-exact tilt compensation matching the simulator formula exactly:
+        tilt_factor = 1 - 2*(qx^2 + qy^2)
+    Divides THRUST_HOVER by tilt_factor so the vertical thrust component
+    always equals hover trim regardless of pitch/roll angle.
+    w_b term removed — vertical velocity damping is handled by altitude hold.
     """
-    tilt = math.cos(phi) * math.cos(theta)
-    tilt = max(tilt, 0.10)   # never divide by near-zero at extreme angles
-    return float(np.clip(base_thrust / tilt + KP_HEAVE * w_b, 0.0, 1.0))
+    tilt = 1.0 - 2.0 * (qx**2 + qy**2)
+    tilt = max(tilt, 0.01)
+    return THRUST_HOVER / tilt
 
 
 # =============================================================================
@@ -198,10 +211,12 @@ class SysIdSegment:
         self._prev_roll_err  = 0.0
         self._prev_yaw_err   = 0.0
         self._psi_target     = None   # locked on first tick
+        self._spawn_z        = None   # Z position at t=0 (NED: negative = above ground)
+        self._alt_target     = None   # target Z = spawn_z - ALTITUDE_BUFFER_M (NED)
 
         print(f'[SYSID] Regime={REGIME_ID}  Axis={EXCITE_AXIS}  Rep={REPETITION}')
         print(f'[SYSID] Target trim: theta={THETA0_DEG:.1f} deg  phi={PHI0_DEG:.1f} deg'
-              f'  T0={T0_NOMINAL:.3f}')
+              f'  hover_thrust={THRUST_HOVER:.3f}')
         print(f'[SYSID] Logging → {CSV_PATH}')
         print(f'[SYSID] Total duration: {TOTAL_DUR:.1f} s')
 
@@ -229,10 +244,14 @@ class SysIdSegment:
         else:
             ax_b=ay_b=az_b=float('nan')
 
-        # Lock yaw target on first tick
+        # Lock yaw target and spawn altitude on first tick
         if self._psi_target is None:
             self._psi_target = psi
+            self._spawn_z    = z_pos
+            # In NED, up = negative Z, so target altitude is spawn_z minus buffer
+            self._alt_target = z_pos - ALTITUDE_BUFFER_M
             print(f'[SYSID] Yaw target locked: {math.degrees(psi):.1f} deg')
+            print(f'[SYSID] Spawn Z={z_pos:.2f}m  Alt target Z={self._alt_target:.2f}m (NED)')
 
         # ── determine phase ───────────────────────────────────────────────────
         if   t < SETTLE_DUR:
@@ -251,7 +270,7 @@ class SysIdSegment:
         # ── compute commands ──────────────────────────────────────────────────
         roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = \
             self._commands(phase, t_excite, phi, theta, psi,
-                           p_r, q_r, r_r, vz_b)
+                           p_r, q_r, r_r, vz_b, qx, qy, z_pos)
 
         # ── log ───────────────────────────────────────────────────────────────
         self._writer.writerow([
@@ -270,7 +289,7 @@ class SysIdSegment:
 
     # ── command computation ───────────────────────────────────────────────────
     def _commands(self, phase, t_ex, phi, theta, psi,
-                  p_r, q_r, r_r, w_b):
+                  p_r, q_r, r_r, w_b, qx, qy, z_pos):
         """
         Compute roll/pitch/yaw/thrust commands for current phase.
 
@@ -310,8 +329,20 @@ class SysIdSegment:
         err_yaw         = (err_yaw + 180.0) % 360.0 - 180.0
         yaw_pid         = KP_YAW * err_yaw - KD_YAW * math.degrees(r_r)
 
-        # ── Tilt-compensated baseline thrust ─────────────────────────────────
-        thrust_base     = _tilt_thrust(T0_NOMINAL, phi, theta, w_b)
+        # ── Tilt-compensated thrust with altitude hold ───────────────────────────
+        # NED convention: up = more negative Z.
+        # alt_target = spawn_z - ALTITUDE_BUFFER_M  (more negative = higher)
+        # alt_err > 0 means z_pos > alt_target → drone is BELOW target → need MORE thrust
+        # alt_err < 0 means z_pos < alt_target → drone is ABOVE target → need LESS thrust
+        # w_b > 0 means moving DOWN → need MORE thrust to slow descent
+        # _tilt_thrust already handles hover compensation; altitude hold adds correction.
+        tilt_comp = _tilt_thrust(qx, qy, 0.0)   # pure tilt compensation, no w_b term
+        if self._alt_target is not None:
+            alt_err          = z_pos - self._alt_target   # >0 = below target in NED
+            alt_thrust_delta = KP_ALT * alt_err + KD_ALT * w_b
+            thrust_base      = float(np.clip(tilt_comp + alt_thrust_delta, 0.0, 1.0))
+        else:
+            thrust_base = tilt_comp
 
         # ── Excitation overlay ────────────────────────────────────────────────
         excite_roll  = 0.0
@@ -335,8 +366,9 @@ class SysIdSegment:
                 excite_pitch = amp * (seq1 + seq2)
 
             elif EXCITE_AXIS == 'yaw':
-                # Single 3211 — yaw recovers slowly so one sequence is enough
-                excite_yaw = amp * _3211(t_ex)
+                seq1 = _3211(t_ex)
+                seq2 = -_3211(t_ex - 7*UNIT - 0.5)
+                excite_yaw = amp * (seq1 + seq2)
 
             elif EXCITE_AXIS == 'heave':
                 # Alternating thrust doublets
@@ -384,7 +416,7 @@ class SysIdSegment:
             'repetition'   : REPETITION,
             'theta0_deg'   : THETA0_DEG,
             'phi0_deg'     : PHI0_DEG,
-            'T0_nominal'   : T0_NOMINAL,
+            'T0_nominal'   : THRUST_HOVER,   # fixed physical constant
             'control_hz'   : CONTROL_HZ,
             'settle_dur'   : SETTLE_DUR,
             'hold_dur'     : HOLD_DUR,
@@ -404,7 +436,7 @@ class SysIdSegment:
 # =============================================================================
 REGIME_TABLE = """
 ╔══════════╦═══════════╦════════════╦══════════════════════════════════════╗
-║ RegimeID ║  theta0   ║   phi0     ║  T0_nominal   Notes                 ║
+║ RegimeID ║  theta0   ║   phi0     ║  T0_nominal   Notes                  ║
 ╠══════════╬═══════════╬════════════╬══════════════════════════════════════╣
 ║ P0       ║   0 deg   ║   0 deg    ║  0.265        Hover baseline         ║
 ║ P1       ║ -20 deg   ║   0 deg    ║  0.28         Mild forward flight    ║
