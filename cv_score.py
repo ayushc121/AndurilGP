@@ -205,7 +205,10 @@ def main():
             n_visible += 1
 
         estimate, _, _ = V.detect_gate(img)
-        detected = estimate is not None
+        # Only RELIABLE detections are meant for back-projection ranging; weak hints
+        # (low/clipped/small, used only for visual-servo descent) would inflate the
+        # centre/range error, so they don't count as "detected" for scoring.
+        detected = estimate is not None and estimate.get('reliable', True)
 
         det_cx = det_cy = det_bw = ''
         center_err = range_err = det_range = ''
