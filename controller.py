@@ -82,6 +82,7 @@ class Controller:
         self._wait_start_sim_ms = None
         self.prev_vy_err        = 0.0
         self.prev_vx_err        = 0.0
+        self._elev_des_cmd      = None   # rate-limited altitude setpoint (Stage B)
         print('Controller state reset.', flush=True)
 
     # ------------------------------------------------------------------
@@ -401,13 +402,25 @@ class Controller:
                 # setpoint) so it stays controllable until it re-acquires a gate.
                 self._blind = getattr(self, '_blind', 0) + 1
                 last = getattr(self, '_last_gate', None)
-                BLIND_HOLD_TICKS  = 25     # ~0.5 s at 50 Hz: ride through brief dropouts
+                BLIND_HOLD_TICKS  = 100    # ~2 s at 50 Hz: COAST toward the last gate
+                # through descent flicker (gate riding the bottom edge drops in/out of
+                # view). Was 25 (~0.5 s): too short, so ACQUIRE kept firing mid-descent
+                # -> forced -15 deg pitch + zeroed forward + held altitude, interrupting
+                # the descent ("pitch fight", stayed high). Coasting keeps descending and
+                # steering at the last back-projected gate until it re-locks.
                 ACQUIRE_MAX_TICKS = 150    # ~3 s of active search before giving up
                 self._acquiring = False
                 self._servo = False
                 if last is not None and self._blind <= BLIND_HOLD_TICKS:
-                    # Brief dropout: coast on the last good gate target.
+                    # Coast on the last good gate target -- but NEVER reverse toward a
+                    # gate we've already PASSED. We fly -north, so a gate behind us has
+                    # g_north > x_pos -> that gave v_des_north > 0 (backward), pitching
+                    # up and stalling after each crossing, then an acquire slam. Clamp
+                    # the north target to stay at least FORWARD_COAST ahead so we glide
+                    # forward while still tracking its lateral + altitude.
+                    FORWARD_COAST = 2.0
                     g_north, g_east, gate_pz = last
+                    g_north = min(g_north, x_pos - FORWARD_COAST)
                 elif self._blind <= BLIND_HOLD_TICKS + ACQUIRE_MAX_TICKS:
                     # ACQUIRE (Phase 3): the next gate sits BELOW the 20°-up camera on
                     # the descending course (offline sweep: 12-17° below horizon ->
@@ -492,8 +505,26 @@ class Controller:
             align = ALIGN_SCALE / (ALIGN_SCALE + abs(vec_e))
             v_des_north *= align
 
-            # Altitude:
-            elev_des = gate_pz - 0.8
+            # Altitude (Stage B) — RATE-LIMIT the setpoint toward the gate altitude.
+            # The back-projected gate_pz steps ~8 m the instant a gate is detected and
+            # jitters frame-to-frame, which slammed thrust (vz~6.8) and added a vertical
+            # wobble. Ramp elev_des toward its target at <= MAX_ELEV_RATE so the descent
+            # is gradual and frame jitter is filtered out. (Setpoint shaping only -- the
+            # thrust PID is untouched, per the guidance/control split.)
+            # ASYMMETRIC: descend as fast as the gate demands (down = no cap, so the
+            # setpoint never lags the descending course), but rate-limit UPWARD motion
+            # of the setpoint so close-range back-projection garbage can't yank the
+            # target up into the gate's top bar. (down = increasing z in NED.)
+            MAX_ELEV_UP_RATE = 3.0       # m/s cap on UPWARD setpoint motion only
+            elev_target = gate_pz - 0.8
+            if self._elev_des_cmd is None:
+                self._elev_des_cmd = z_pos          # start from current altitude
+            delta = elev_target - self._elev_des_cmd
+            max_up = MAX_ELEV_UP_RATE * dt
+            if delta < -max_up:          # target jumped UP faster than the cap
+                delta = -max_up
+            self._elev_des_cmd += delta
+            elev_des = self._elev_des_cmd
 
             # --- DIAG: vision-vs-telemetry navigation log (no behaviour change). One
             # row per tick: drone pose, the VISION-derived gate target, the TELEMETRY
