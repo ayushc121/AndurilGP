@@ -201,16 +201,20 @@ def main():
     out.write('frame,has_pose,n_visible,exp_gate,exp_cx,exp_cy,exp_depth_m,'
               'detected,det_cx,det_cy,det_bw,center_err_px,'
               'det_range_perp_m,true_depth_m,range_err_m,matched,'
-              'true_cam_x_m,true_cam_y_m,det_cam_x_m,det_cam_y_m,trans3d_err_m\n')
+              'true_cam_x_m,true_cam_y_m,det_cam_x_m,det_cam_y_m,trans3d_err_m,'
+              'pnp_ok,pnp_cam_x_m,pnp_cam_y_m,pnp_cam_z_m,pnp_trans3d_err_m,pnp_reproj_px\n')
 
     n = n_pose = n_visible = n_det_when_visible = n_matched = 0
-    center_errs = []
-    range_errs  = []
+    center_errs  = []
+    range_errs   = []
     trans3d_errs = []
+    pnp_ok_count  = 0
+    pnp_trans3d_errs = []
 
     # Per range-bucket accumulators: n_vis, n_det, center_errs, range_errs, trans3d_errs
-    buckets = [{'n_vis': 0, 'n_det': 0,
-                'center_errs': [], 'range_errs': [], 'trans3d_errs': []}
+    buckets = [{'n_vis': 0, 'n_det': 0, 'n_pnp': 0,
+                'center_errs': [], 'range_errs': [],
+                'trans3d_errs': [], 'pnp_trans3d_errs': []}
                for _ in RANGE_BUCKET_LABELS]
 
     for path in frames:
@@ -306,10 +310,32 @@ def main():
                 else:
                     matched = 0
 
+        # PnP scoring against oracle — separate from bbox metrics
+        pnp_ok_s = pnp_cam_x_s = pnp_cam_y_s = pnp_cam_z_s = pnp_t3d_s = pnp_reproj_s = ''
+        if exp and detected and estimate.get('pnp_ok'):
+            gi, gpx, gpy, gdepth, true_cam_x, true_cam_y = exp
+            bi = _range_bucket(gdepth)
+            tv = estimate['pnp_tvec']
+            pnp_cx, pnp_cy, pnp_cz = float(tv[0]), float(tv[1]), float(tv[2])
+            t3d_pnp = math.sqrt((true_cam_x - pnp_cx)**2
+                                + (true_cam_y - pnp_cy)**2
+                                + (gdepth    - pnp_cz)**2)
+            pnp_ok_count += 1
+            pnp_trans3d_errs.append(t3d_pnp)
+            buckets[bi]['n_pnp'] += 1
+            buckets[bi]['pnp_trans3d_errs'].append(t3d_pnp)
+            pnp_ok_s     = '1'
+            pnp_cam_x_s  = f'{pnp_cx:.3f}'
+            pnp_cam_y_s  = f'{pnp_cy:.3f}'
+            pnp_cam_z_s  = f'{pnp_cz:.3f}'
+            pnp_t3d_s    = f'{t3d_pnp:.3f}'
+            pnp_reproj_s = f'{estimate.get("pnp_reproj", float("nan")):.2f}'
+
         out.write(f'{fid},1,{len(visible)},{exp_gate},{exp_cx},{exp_cy},{exp_depth},'
                   f'{int(detected)},{det_cx},{det_cy},{det_bw},{center_err},'
                   f'{det_range},{exp_depth},{range_err},{matched},'
-                  f'{true_cam_x_s},{true_cam_y_s},{det_cam_x_s},{det_cam_y_s},{trans3d_s}\n')
+                  f'{true_cam_x_s},{true_cam_y_s},{det_cam_x_s},{det_cam_y_s},{trans3d_s},'
+                  f'{pnp_ok_s},{pnp_cam_x_s},{pnp_cam_y_s},{pnp_cam_z_s},{pnp_t3d_s},{pnp_reproj_s}\n')
 
     out.close()
 
@@ -345,22 +371,25 @@ def main():
     if trans3d_errs:
         print(f'  3D trans error m:  median {med(trans3d_errs):.2f}  '
               f'p90 {p90(trans3d_errs):.2f}  max {max(trans3d_errs):.2f}')
-        print(f'  (3D trans error = PnP oracle: tvec error in camera frame)')
+        print(f'  (3D trans error = oracle: camera-frame tvec error)')
+    if pnp_trans3d_errs:
+        print(f'  PnP 3D error m:    median {med(pnp_trans3d_errs):.2f}  '
+              f'p90 {p90(pnp_trans3d_errs):.2f}  max {max(pnp_trans3d_errs):.2f}  '
+              f'(on {pnp_ok_count}/{n_det_when_visible} detected frames)')
 
-    print(f'\nDetection by range bucket (true depth to gate):')
-    hdr = (f'  {"Bucket":<10}  {"Visible":>8}  {"Detected":>9}  {"Det%":>6}  '
-           f'{"Ctr px":>7}  {"Range m":>8}  {"3D m":>7}')
+    print(f'\nDetection + PnP by range bucket (true depth to gate):')
+    hdr = (f'  {"Bucket":<10}  {"Vis":>5}  {"Det%":>6}  '
+           f'{"BboxT3D":>8}  {"PnP%":>6}  {"PnPT3D":>8}  {"PnPReproj":>10}')
     print(hdr)
     print('  ' + '-' * (len(hdr) - 2))
     for i, label in enumerate(RANGE_BUCKET_LABELS):
         b = buckets[i]
-        nv, nd = b['n_vis'], b['n_det']
-        dp  = pct(nd, nv)
-        cep = f'{med(b["center_errs"]):.1f}' if b['center_errs'] else '  —'
-        rep = f'{med(b["range_errs"]):.2f}' if b['range_errs'] else '   —'
-        t3p = f'{med(b["trans3d_errs"]):.2f}' if b['trans3d_errs'] else '   —'
-        det_str = f'{nd:>9}  {dp:>5.0f}%' if nv else f'{"—":>9}  {"—":>5}'
-        print(f'  {label:<10}  {nv:>8}  {det_str}  {cep:>7}  {rep:>8}  {t3p:>7}')
+        nv, nd, np_ = b['n_vis'], b['n_det'], b['n_pnp']
+        dep  = f'{pct(nd, nv):>5.0f}%' if nv else '    —'
+        bxt3 = f'{med(b["trans3d_errs"]):>8.2f}' if b['trans3d_errs'] else '       —'
+        pnpp = f'{pct(np_, nd):>5.0f}%' if nd else '    —'
+        pt3  = f'{med(b["pnp_trans3d_errs"]):>8.2f}' if b['pnp_trans3d_errs'] else '       —'
+        print(f'  {label:<10}  {nv:>5}  {dep}  {bxt3}  {pnpp}  {pt3}')
 
     print(f'\n  per-frame CSV -> {OUT_CSV}')
     print('\nInterpretation:')

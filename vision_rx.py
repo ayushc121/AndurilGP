@@ -27,6 +27,26 @@ CAM_TILT_DEG = 20.0
 GATE_WIDTH_M = 2.7
 
 # --------------------------------------------------------------------------------------
+# PnP: known gate geometry for solvePnP (spec §3.7)
+# Object frame: gate centre = origin, X right, Y up, Z toward camera.
+# IPPE_SQUARE point order: TL, TR, BR, BL.
+# --------------------------------------------------------------------------------------
+_GATE_HALF    = GATE_WIDTH_M / 2.0          # 1.35 m
+_GATE_OBJ_PTS = np.array([
+    [-_GATE_HALF,  _GATE_HALF, 0.0],        # TL
+    [ _GATE_HALF,  _GATE_HALF, 0.0],        # TR
+    [ _GATE_HALF, -_GATE_HALF, 0.0],        # BR
+    [-_GATE_HALF, -_GATE_HALF, 0.0],        # BL
+], dtype=np.float32)
+_CAM_K    = np.array([[FX, 0, CX], [0, FY, CY], [0, 0, 1.0]], dtype=np.float32)
+_CAM_DIST = np.zeros((4, 1), dtype=np.float32)          # spec: no distortion
+_HAS_IPPE = hasattr(cv2, 'SOLVEPNP_IPPE_SQUARE')        # OpenCV >= 3.4.5
+
+# Reject a PnP solve whose RMS reprojection error exceeds this threshold.
+# Tightened per-range in _solve_gate_pnp; this is the hard ceiling.
+PNP_MAX_REPROJ_PX = 12.0
+
+# --------------------------------------------------------------------------------------
 # Gate colour — red on dark/grey background.
 # Red wraps around the HSV hue circle in OpenCV (0–180 scale), so two
 # ranges are needed: one near 0° and one near 180°.
@@ -89,6 +109,78 @@ DUMP_MAX_SETS    = 400     # stop dumping after this many sets (disk-flood guard
 INSTR_AREA_FLOOR = 100     # log/draw contours down to this area (below MIN_CONTOUR_AREA)
 
 
+def _extract_gate_corners(img, contour):
+    """
+    Extract 4 gate corners from the outer red contour.
+    Returns (4, 2) float32 ordered [TL, TR, BR, BL] in image coords, or None.
+
+    Strategy: convex hull collapses the hollow frame into its 4 outer vertices,
+    then approxPolyDP simplifies to a quad. cornerSubPix refines to sub-pixel.
+    """
+    hull  = cv2.convexHull(contour)
+    peri  = cv2.arcLength(hull, True)
+    approx = cv2.approxPolyDP(hull, 0.05 * peri, True)
+    if len(approx) != 4:
+        return None
+    pts = approx.reshape(4, 2).astype(np.float32)
+
+    # Sub-pixel refinement on grayscale — strong gradients at gate edges.
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1)
+    try:
+        cv2.cornerSubPix(gray, pts, (7, 7), (-1, -1), crit)
+    except Exception:
+        pass
+
+    # Order as [TL, TR, BR, BL] for IPPE_SQUARE:
+    # TL = smallest x+y, BR = largest x+y, TR = smallest y-x, BL = largest y-x.
+    s = pts.sum(axis=1)
+    d = np.diff(pts, axis=1).flatten()
+    return np.array([
+        pts[np.argmin(s)],
+        pts[np.argmin(d)],
+        pts[np.argmax(s)],
+        pts[np.argmax(d)],
+    ], dtype=np.float32)
+
+
+def _solve_gate_pnp(corners):
+    """
+    Run PnP on 4 ordered outer-gate corners. Returns (tvec, rvec, reproj_err)
+    in camera frame (x=right, y=down, z=forward), metres, or (None, None, inf).
+
+    IPPE_SQUARE returns 2 solutions; we pick the one with positive depth (gate
+    in front of camera) and lower reprojection error. Falls back to ITERATIVE
+    when IPPE is unavailable.
+    """
+    try:
+        if _HAS_IPPE:
+            n, rvecs, tvecs, errors = cv2.solvePnPGeneric(
+                _GATE_OBJ_PTS, corners, _CAM_K, _CAM_DIST,
+                flags=cv2.SOLVEPNP_IPPE_SQUARE)
+            best_i, best_err = None, float('inf')
+            for i in range(n):
+                depth = float(tvecs[i][2, 0])    # tvecs[i] is (3,1); scalar via [2,0]
+                err   = float(errors[i].flat[0])  # errors[i] is (1,); scalar via .flat[0]
+                if depth > 0.3 and err < best_err:
+                    best_err, best_i = err, i
+            if best_i is None:
+                return None, None, float('inf')
+            return tvecs[best_i].flatten(), rvecs[best_i].flatten(), best_err
+        else:
+            ok, rvec, tvec = cv2.solvePnP(
+                _GATE_OBJ_PTS, corners, _CAM_K, _CAM_DIST,
+                flags=cv2.SOLVEPNP_ITERATIVE)
+            if not ok or float(tvec[2]) <= 0.3:
+                return None, None, float('inf')
+            proj, _ = cv2.projectPoints(_GATE_OBJ_PTS, rvec, tvec, _CAM_K, _CAM_DIST)
+            err = float(np.mean(np.linalg.norm(
+                proj.reshape(4, 2) - corners.reshape(4, 2), axis=1)))
+            return tvec.flatten(), rvec.flatten(), err
+    except Exception:
+        return None, None, float('inf')
+
+
 def body_relative_pose(estimate):
     """
     Augment a detection estimate with telemetry-free body-relative pose fields.
@@ -111,20 +203,26 @@ def body_relative_pose(estimate):
     """
     if estimate is None:
         return estimate
-    bw = estimate.get('bw', 0)
-    cx = estimate.get('cx', CX)
-    cy = estimate.get('cy', CY)
 
-    if not bw:
-        nan = float('nan')
-        estimate.update(cam_x_m=nan, cam_y_m=nan, cam_z_m=nan,
-                        body_x_m=nan, body_y_m=nan, body_z_m=nan)
-        return estimate
-
-    # Depth from known gate width via pinhole.
-    cam_z_m = (FX * GATE_WIDTH_M) / bw
-    cam_x_m = (cx - CX) * cam_z_m / FX   # right in camera
-    cam_y_m = (cy - CY) * cam_z_m / FY   # down in camera
+    if estimate.get('pnp_ok'):
+        # PnP path: tvec is already in camera frame (x=right, y=down, z=forward).
+        tvec    = estimate['pnp_tvec']
+        cam_x_m = float(tvec[0])
+        cam_y_m = float(tvec[1])
+        cam_z_m = float(tvec[2])
+    else:
+        # Pinhole fallback: range from known gate width + bearing from centroid.
+        bw = estimate.get('bw', 0)
+        cx = estimate.get('cx', CX)
+        cy = estimate.get('cy', CY)
+        if not bw:
+            nan = float('nan')
+            estimate.update(cam_x_m=nan, cam_y_m=nan, cam_z_m=nan,
+                            body_x_m=nan, body_y_m=nan, body_z_m=nan)
+            return estimate
+        cam_z_m = (FX * GATE_WIDTH_M) / bw
+        cam_x_m = (cx - CX) * cam_z_m / FX   # right in camera
+        cam_y_m = (cy - CY) * cam_z_m / FY   # down in camera
 
     # Camera → body: fixed 20° upward tilt (same matrix as controller).
     t   = math.radians(CAM_TILT_DEG)
@@ -218,7 +316,22 @@ def detect_gate(img):
         'area':      area,
         'bx': bx, 'by': by, 'bw': bw, 'bh': bh,
         'reliable':  reliable,
+        'pnp_ok':    False,
     }
+
+    # PnP: extract 4 corners + solve for full 6-DoF gate-relative pose.
+    # Only attempted on reliable detections; falls back to bbox silently.
+    if reliable:
+        corners = _extract_gate_corners(img, best)
+        if corners is not None:
+            tvec, rvec, reproj = _solve_gate_pnp(corners)
+            if tvec is not None and reproj < PNP_MAX_REPROJ_PX:
+                estimate['pnp_ok']      = True
+                estimate['pnp_tvec']    = tvec     # [cam_x_m, cam_y_m, cam_z_m]
+                estimate['pnp_rvec']    = rvec
+                estimate['pnp_reproj']  = reproj
+                estimate['pnp_corners'] = corners  # (4,2) for overlay
+
     return estimate, mask, contours
 
 
