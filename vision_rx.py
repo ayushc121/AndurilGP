@@ -1,3 +1,4 @@
+import math
 import os
 import socket
 import struct
@@ -20,6 +21,10 @@ CX, CY       = 320.0, 180.0
 FX = FY      = 320.0
 # Camera is tilted 20° upward from body frame — the controller accounts for
 # this when converting pixel offsets into NED velocity corrections.
+CAM_TILT_DEG = 20.0
+
+# Gate outer width used for pinhole range (spec §3.7)
+GATE_WIDTH_M = 2.7
 
 # --------------------------------------------------------------------------------------
 # Gate colour — red on dark/grey background.
@@ -82,6 +87,56 @@ DUMP_DIR         = 'vision_dump'
 DUMP_EVERY_N     = 15      # save the image trio every this many PROCESSED frames
 DUMP_MAX_SETS    = 400     # stop dumping after this many sets (disk-flood guard)
 INSTR_AREA_FLOOR = 100     # log/draw contours down to this area (below MIN_CONTOUR_AREA)
+
+
+def body_relative_pose(estimate):
+    """
+    Augment a detection estimate with telemetry-free body-relative pose fields.
+    Called after EMA smoothing so the smoothed bbox values are used.
+
+    Adds to estimate (in-place and returns it):
+      cam_x_m  — lateral offset in camera frame (right = +), metres
+      cam_y_m  — vertical offset in camera frame (down = +), metres
+      cam_z_m  — depth along optical axis (forward = +), metres
+      body_x_m — forward component in body frame (body NED X), metres
+      body_y_m — right component in body frame (body NED Y), metres
+      body_z_m — down component in body frame (body NED Z), metres
+
+    Convention matches the back-projection in controller._gate_world_direction and
+    the oracle in cv_score.project_gate — same 20° tilt matrix, same sign choices.
+    All values are NaN when bw == 0 (degenerate bbox).
+
+    This is the Round-2 output contract: the controller can steer toward the gate
+    using only these body-relative fields, with zero telemetry.
+    """
+    if estimate is None:
+        return estimate
+    bw = estimate.get('bw', 0)
+    cx = estimate.get('cx', CX)
+    cy = estimate.get('cy', CY)
+
+    if not bw:
+        nan = float('nan')
+        estimate.update(cam_x_m=nan, cam_y_m=nan, cam_z_m=nan,
+                        body_x_m=nan, body_y_m=nan, body_z_m=nan)
+        return estimate
+
+    # Depth from known gate width via pinhole.
+    cam_z_m = (FX * GATE_WIDTH_M) / bw
+    cam_x_m = (cx - CX) * cam_z_m / FX   # right in camera
+    cam_y_m = (cy - CY) * cam_z_m / FY   # down in camera
+
+    # Camera → body: fixed 20° upward tilt (same matrix as controller).
+    t   = math.radians(CAM_TILT_DEG)
+    ct  = math.cos(t)
+    st  = math.sin(t)
+    body_x_m =  ct * cam_z_m + st * cam_y_m   # forward (body X)
+    body_y_m =  cam_x_m                         # right   (body Y)
+    body_z_m = -st * cam_z_m + ct * cam_y_m   # down    (body Z, NED)
+
+    estimate.update(cam_x_m=cam_x_m, cam_y_m=cam_y_m, cam_z_m=cam_z_m,
+                    body_x_m=body_x_m, body_y_m=body_y_m, body_z_m=body_z_m)
+    return estimate
 
 
 def detect_gate(img):
@@ -317,6 +372,10 @@ class VisionRX:
         # gate-switches. Instrumentation above logs the RAW detection, so offline
         # scoring still sees unsmoothed detections.
         estimate, self._ema_prev = ema_smooth(self._ema_prev, estimate)
+
+        # Add telemetry-free body-relative pose fields to the smoothed estimate.
+        # These allow Round-2 controllers to steer without attitude/position data.
+        body_relative_pose(estimate)
 
         if estimate is None:
             self.data['vision_gate_estimate'] = None
