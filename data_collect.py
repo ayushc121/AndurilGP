@@ -183,53 +183,79 @@ def main():
         wait_ticks += 1
         time.sleep(0.1)
 
-    # ── Phase 3: Wait for GATE_INFO ───────────────────────────────────────────
-    print('Waiting for gate list (Training mode required)...', flush=True)
-    deadline = time.time() + MAX_WAIT_GATE_S
+    # ── Phase 3: Try to receive GATE_INFO (VQ2) or fall back to course sweep ──
+    # GATE_INFO is only transmitted in VQ2.  In VQ1 training we skip straight
+    # to the sweep after a short wait.
+    GATE_INFO_WAIT_S = 10.0
+    print(f'Waiting up to {GATE_INFO_WAIT_S:.0f} s for GATE_INFO (VQ2 only)...',
+          flush=True)
+    deadline = time.time() + GATE_INFO_WAIT_S
     gates = []
     while time.time() < deadline:
         with shared_data['lock']:
-            raw_gates = shared_data.get('gates')   # None until track data arrives
+            raw_gates = shared_data.get('gates')
         if raw_gates:
             gates = list(raw_gates)
-            print(f'  {len(gates)} gate(s) received.', flush=True)
+            print(f'  GATE_INFO received: {len(gates)} gate(s).', flush=True)
             break
         time.sleep(0.2)
 
-    if not gates:
-        print('ERROR: no GATE_INFO received.  Is this a Training flight?', flush=True)
-        for name in ('heartbeat', 'ts_loop', 'mavlink_rx', 'vision_rx'):
-            components[name].get_thread_for_join().join(timeout=2.0)
-        return
+    # ── Phase 4: Fly approach waypoints ───────────────────────────────────────
+    if gates:
+        # VQ2 path: approach each gate at multiple standoff distances
+        print(f'\nApproaching {len(gates)} gate(s) at standoffs: '
+              f'{STANDOFF_DISTANCES_M} m', flush=True)
 
-    # ── Phase 4: Approach each gate at decreasing standoff distances ──────────
-    print(f'\nApproaching {len(gates)} gate(s) at standoffs: {STANDOFF_DISTANCES_M} m',
-          flush=True)
+        for gate_idx, gate in enumerate(gates):
+            gx = gate['pos_x']
+            gy = gate['pos_y']
+            gz = gate['pos_z']
+            approach = _gate_approach_dir(gates, gate_idx)
+            yaw_rad  = math.atan2(approach[1], approach[0])
 
-    for gate_idx, gate in enumerate(gates):
-        gx = gate['pos_x']
-        gy = gate['pos_y']
-        gz = gate['pos_z']
+            print(f'\n--- Gate {gate_idx}  NED=({gx:.1f}, {gy:.1f}, {gz:.1f})  '
+                  f'yaw={math.degrees(yaw_rad):.0f} deg ---', flush=True)
 
-        approach   = _gate_approach_dir(gates, gate_idx)
-        yaw_rad    = math.atan2(approach[1], approach[0])
+            for standoff in STANDOFF_DISTANCES_M:
+                tx = gx - approach[0] * standoff
+                ty = gy - approach[1] * standoff
+                tz = gz
+                print(f'  standoff {standoff:>3d} m  ({tx:.1f}, {ty:.1f}, {tz:.1f})',
+                      flush=True)
+                _approach_and_dwell(sim_conn, shared_data, target_sys, target_comp,
+                                    tx, ty, tz, yaw_rad, system_boot_ms)
+                print('    done', flush=True)
 
-        print(f'\n--- Gate {gate_idx}  NED=({gx:.1f}, {gy:.1f}, {gz:.1f})  '
-              f'yaw={math.degrees(yaw_rad):.0f} deg ---', flush=True)
+    else:
+        # VQ1 path: no gate positions available — sweep the full course in
+        # 8 m steps along the -x axis (southward) at spawn altitude.
+        # vision_rx INSTRUMENT mode captures frames every 15 processed frames
+        # throughout, giving coverage at all approach ranges for each gate.
+        print('\nNo GATE_INFO — running VQ1 course sweep.', flush=True)
 
-        for standoff in STANDOFF_DISTANCES_M:
-            # Hover standoff metres in front of the gate along the approach path
-            tx = gx - approach[0] * standoff
-            ty = gy - approach[1] * standoff
-            tz = gz  # match gate altitude
+        with shared_data['lock']:
+            odo = shared_data.get('odometry')
+        spawn_x = odo['x'] if odo else 0.0
+        spawn_y = odo['y'] if odo else 0.0
+        spawn_z = odo['z'] if odo else -2.5  # NED: negative = above ground
 
-            print(f'  standoff {standoff:>3d} m  →  ({tx:.1f}, {ty:.1f}, {tz:.1f})',
-                  flush=True)
+        SWEEP_STEP_M  = 8      # metres between hover points along course
+        SWEEP_TOTAL_M = 148    # total distance to cover (beyond all known gates)
+        # Face south (-x direction = course heading)
+        yaw_rad = math.atan2(0.0, -1.0)  # atan2(dy=0, dx=-1) = π ≈ south
 
+        n_steps = SWEEP_TOTAL_M // SWEEP_STEP_M
+        print(f'Sweep: {n_steps} waypoints, {SWEEP_STEP_M} m apart, '
+              f'from x={spawn_x:.1f} to x={spawn_x - SWEEP_TOTAL_M:.1f}', flush=True)
+
+        for step in range(1, n_steps + 1):
+            tx = spawn_x - step * SWEEP_STEP_M
+            ty = spawn_y
+            tz = spawn_z
+            print(f'  wp {step:>2d}/{n_steps}  x={tx:.1f}', flush=True)
             _approach_and_dwell(sim_conn, shared_data, target_sys, target_comp,
                                 tx, ty, tz, yaw_rad, system_boot_ms)
-
-            print(f'    done', flush=True)
+            print('    done', flush=True)
 
     print('\nData collection complete.  Frames saved to vision_dump/', flush=True)
 
