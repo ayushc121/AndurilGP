@@ -131,7 +131,9 @@ def main():
     target_comp = sim_conn.target_component
 
     # ── Phase 1: Arm ──────────────────────────────────────────────────────────
-    print('Arming drone...', flush=True)
+    print('Arming drone...  (start a Training flight in the sim if stuck here)',
+          flush=True)
+    arm_ticks = 0
     while True:
         sim_conn.mav.command_long_send(
             target_sys, target_comp,
@@ -141,23 +143,44 @@ def main():
             0, 0, 0, 0, 0, 0,
         )
         time.sleep(ARM_RETRY_S)
+        arm_ticks += 1
         with shared_data['lock']:
             armed = shared_data.get('armed', False)
             odo   = shared_data.get('odometry')
         if armed and odo is not None:
             print('Armed.', flush=True)
             break
+        if arm_ticks % 5 == 0:
+            print(f'  still waiting to arm... (armed={armed}, odo={'ok' if odo else 'none'})',
+                  flush=True)
 
     # ── Phase 2: Wait for race start ──────────────────────────────────────────
+    # race_status is None until the first RACE_STATUS MAVLink message arrives.
+    # Use the same freshness anchor as controller.py: record sim_ms when we
+    # enter this phase, then wait until race_start_boot_time_ms > that anchor.
     print('Waiting for race start...', flush=True)
+    anchor_ms = None
+    wait_ticks = 0
     while True:
         with shared_data['lock']:
-            rs       = shared_data.get('race_status', {})
-            sim_ms   = rs.get('sim_boot_time_ms', 0)
-            start_ms = rs.get('race_start_boot_time_ms', -1)
-        if start_ms is not None and start_ms > 0 and sim_ms >= start_ms:
-            print('Race started — beginning data collection.', flush=True)
-            break
+            rs = shared_data.get('race_status')  # may be None initially
+        if rs is not None:
+            sim_ms   = rs['sim_boot_time_ms']
+            start_ms = rs['race_start_boot_time_ms']
+            if anchor_ms is None:
+                anchor_ms = sim_ms
+            race_is_fresh  = start_ms > 0 and start_ms >= anchor_ms
+            countdown_done = race_is_fresh and sim_ms >= start_ms
+            if countdown_done:
+                print('Race started — beginning data collection.', flush=True)
+                break
+            if wait_ticks % 20 == 0:
+                print(f'  sim_ms={sim_ms}  race_start={start_ms}  '
+                      f'fresh={race_is_fresh}', flush=True)
+        else:
+            if wait_ticks % 20 == 0:
+                print('  no race_status yet...', flush=True)
+        wait_ticks += 1
         time.sleep(0.1)
 
     # ── Phase 3: Wait for GATE_INFO ───────────────────────────────────────────
@@ -166,8 +189,9 @@ def main():
     gates = []
     while time.time() < deadline:
         with shared_data['lock']:
-            gates = list(shared_data.get('gates', []))
-        if gates:
+            raw_gates = shared_data.get('gates')   # None until track data arrives
+        if raw_gates:
+            gates = list(raw_gates)
             print(f'  {len(gates)} gate(s) received.', flush=True)
             break
         time.sleep(0.2)
