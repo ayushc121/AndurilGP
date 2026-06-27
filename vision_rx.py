@@ -489,6 +489,9 @@ class VisionRX:
         self._dump_sets  = 0
         self._ema_prev   = None     # previous smoothed bbox (EMA state)
         self._pnp_ema    = None     # (tvec, gate_id) — PnP tvec EMA state
+        # Gate-passthrough suppression state
+        self._in_gate         = False  # True while gate area > threshold (inside gate)
+        self._pass_cooldown   = 0      # frames left to suppress after passing through
         # Clear last run's dumped frames so vision_dump/ always matches the
         # freshly-rewritten vision_log.csv. Frame IDs restart at 0 each run, so
         # leftover frames would silently bind to the WRONG run's pose and corrupt
@@ -589,6 +592,41 @@ class VisionRX:
         # Diagnostics only — runs every frame, does not touch the raw detection.
         if INSTRUMENT:
             self._instrument(frame_id, img, mask, contours)
+
+        # ---- Gate passthrough suppression ----------------------------------------
+        # When the drone enters a gate's close-range zone (contour area grows very
+        # large) the centroid is useless for steering.  Suppress the published
+        # estimate while inside the gate, then hold that suppression for a short
+        # cooldown after the area drops — preventing the controller from locking
+        # back onto the gate it just flew through.
+        #
+        # Threshold 12000 px² ≈ gate width ~110 px ≈ range ~8 m.  Cooldown 25 frames
+        # ≈ 0.8 s at 30 fps; at 4 m/s that's ~3 m of forward travel after passthrough.
+        _PASS_AREA_PX     = 12000
+        _PASS_COOLDOWN_FR = 25
+
+        _raw_area = estimate['area'] if estimate is not None else 0
+
+        if _raw_area > _PASS_AREA_PX:
+            # Drone is inside / immediately in front of the gate.
+            if not self._in_gate:
+                self._in_gate = True   # transition: entered gate zone
+            self.data['vision_gate_estimate'] = None
+            return None
+
+        if self._in_gate:
+            # Gate area just dropped — drone passed through.  Start cooldown and
+            # reset EMA so the next gate starts tracking from scratch.
+            self._in_gate       = False
+            self._pass_cooldown = _PASS_COOLDOWN_FR
+            self._ema_prev      = None
+            self._pnp_ema       = None
+
+        if self._pass_cooldown > 0:
+            self._pass_cooldown -= 1
+            self.data['vision_gate_estimate'] = None
+            return None
+        # --------------------------------------------------------------------------
 
         # Temporal smoothing of the PUBLISHED estimate (steadies the gate centre the
         # controller chases). State on the instance; ema_smooth resets it on gaps /
