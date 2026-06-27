@@ -28,7 +28,7 @@ DO_SAVE = pr.Results.save;
 
 g = 9.81;
 
-% Full parameter vector (15 elements):
+% Full parameter vector (16 elements):
 %   1=Xu_m  2=Xuu_m  3=Yv_m  4=Yvv_m  5=Tmax_m  6=Zw_m  7=Zww_m
 %   8=Gamma1  9=tau_p  10=Gamma2  11=tau_q  12=Gamma3  13=tau_r
 %   14=Lp  15=Mq  16=Nr
@@ -56,29 +56,48 @@ tag = sprintf('%s_%s_%d', regime_id, excite_axis, rep);
 fprintf('\n=== analyze_segment: %s ===\n', tag);
 
 % =============================================================================
-% 2. Load CSV — numeric columns + phase_tag text column
+% 2. Load CSV using a single readtable call for consistency
+%
+% Using readtable for everything avoids row-count mismatches between
+% readmatrix (numeric only) and readtable (all columns). The CSV column
+% order is fixed:
+%   1=t  2=x  3=y  4=z  5=vx_b  6=vy_b  7=vz_b
+%   8=phi  9=theta  10=psi  11=p  12=q  13=r
+%   14=ax_b  15=ay_b  16=az_b  (unused)
+%   17=cmd_roll  18=cmd_pitch  19=cmd_yaw  20=cmd_thrust
+%   21=phase_tag  22=regime_id
 % =============================================================================
-raw = readmatrix(csv_path);
+opts               = detectImportOptions(csv_path);
+opts.DataLines     = [2, Inf];
+opts.VariableNamesLine = 1;
+T_full             = readtable(csv_path, opts);
 
-opts           = detectImportOptions(csv_path);
-opts.DataLines = [2, Inf];
-T_full         = readtable(csv_path, opts);
-phase_col      = T_full{:, 'phase_tag'};
+% Verify expected columns exist
+expected_cols = {'t','x','y','z','vx_b','vy_b','vz_b', ...
+                 'phi','theta','psi','p','q','r', ...
+                 'cmd_roll','cmd_pitch','cmd_yaw','cmd_thrust','phase_tag'};
+for ec = expected_cols
+    if ~ismember(ec{1}, T_full.Properties.VariableNames)
+        error('[%s] CSV missing expected column: %s', tag, ec{1});
+    end
+end
 
-time_all       = raw(:,1);
-vx_b_all       = raw(:,5);
-vy_b_all       = raw(:,6);
-vz_b_all       = raw(:,7);
-phi_all        = raw(:,8);
-theta_all      = raw(:,9);
-psi_all        = raw(:,10);
-p_all          = raw(:,11);
-q_all          = raw(:,12);
-r_all          = raw(:,13);
-cmd_roll_all   = raw(:,17);
-cmd_pitch_all  = raw(:,18);
-cmd_yaw_all    = raw(:,19);
-cmd_thrust_all = raw(:,20);
+% Extract all columns by name — immune to column order changes
+time_all       = T_full.t;
+vx_b_all       = T_full.vx_b;
+vy_b_all       = T_full.vy_b;
+vz_b_all       = T_full.vz_b;
+phi_all        = T_full.phi;
+theta_all      = T_full.theta;
+psi_all        = T_full.psi;
+p_all          = T_full.p;
+q_all          = T_full.q;
+r_all          = T_full.r;
+cmd_roll_all   = T_full.cmd_roll;
+cmd_pitch_all  = T_full.cmd_pitch;
+cmd_yaw_all    = T_full.cmd_yaw;
+cmd_thrust_all = T_full.cmd_thrust;
+phase_col      = T_full.phase_tag;
 
 % =============================================================================
 % 3. Trim verification from hold phase
@@ -98,7 +117,9 @@ else
 
     theta_err = abs(rad2deg(theta0_actual - theta0_tgt));
     phi_err   = abs(rad2deg(phi0_actual   - phi0_tgt));
-    trim_ok   = (theta_err < 7.0) && (phi_err < 7.0);
+    % Use 10 deg tolerance — banked regimes take longer to settle
+    % and trim verification is done on hold phase which may have slight error
+    trim_ok   = (theta_err < 10.0) && (phi_err < 10.0);
 
     fprintf('Trim:  theta target=%.1f  actual=%.1f  err=%.1f deg\n', ...
             rad2deg(theta0_tgt), rad2deg(theta0_actual), theta_err);
@@ -132,6 +153,24 @@ cr    = cmd_roll_all(exc_mask);
 cp_   = cmd_pitch_all(exc_mask);
 cy    = cmd_yaw_all(exc_mask);
 ct    = cmd_thrust_all(exc_mask);
+
+% ── Sign and continuity corrections ──────────────────────────────────────────
+% PITCH: simulator reports pitchspeed with opposite sign to thetadot.
+% Confirmed: positive cmd_pitch → negative q_raw → positive thetadot (nose-up).
+% Negate q_e so it is consistent with thetadot = q_e * cos(phi).
+if strcmp(excite_axis, 'pitch')
+    q_e = -q_e;
+    fprintf('[INFO] q_e negated for pitch convention correction.\n');
+end
+
+% YAW: psi wraps at ±pi. Unwrap so OE integrates a continuous signal.
+% Without this, the model integrates smoothly while measured psi jumps ±2pi.
+if strcmp(excite_axis, 'yaw')
+    psi_e = unwrap(psi_e);
+    fprintf('[INFO] psi_e unwrapped. Range: [%.3f, %.3f] rad\n', ...
+            min(psi_e), max(psi_e));
+end
+% ─────────────────────────────────────────────────────────────────────────────
 
 N  = length(time);
 dt = mean(diff(time));
@@ -172,87 +211,118 @@ lsq_opts = optimoptions('lsqlin', 'Display', 'off');
 %   (b) Fallback values in build_gain_schedule.m for regimes missing a test
 % They do NOT affect identification quality for the excited axis.
 % =========================================================================
-PRIOR_Xu_m   = -0.30;  PRIOR_Xuu_m = 0.0;   % <-- update from P0_pitch
-PRIOR_Yv_m   = -0.30;  PRIOR_Yvv_m = 0.0;   % <-- update from B1 roll tests
-PRIOR_Tmax_m =  37.0;  PRIOR_Zw_m  = -1.0;  PRIOR_Zww_m = 0.0;  % <-- P0_heave
-PRIOR_G1     =  0.0;   PRIOR_tau_p =  5.5;   % <-- update from P0_roll
-PRIOR_G2     =  0.0;   PRIOR_tau_q = -0.8;   % <-- update from P0_pitch
-PRIOR_G3     =  0.0;   PRIOR_tau_r =  3.8;   % <-- update from P0_yaw
-PRIOR_Lp     = -2.0;   % <-- update from P0_roll  (was -22 in your test)
-PRIOR_Mq     = -2.0;   % <-- update from P0_pitch
-PRIOR_Nr     = -2.0;   % <-- update from P0_yaw
+PRIOR_Xu_m   = -0.0117; PRIOR_Xuu_m = -0.0493;  % Xu_m_true and Xuu_m from sub-task 1 regression
+PRIOR_Yv_m   = -0.08899; PRIOR_Yvv_m = -0.03909; % identified from lateral trim sweep fit_yv_m.m
+PRIOR_Tmax_m =  36.24; PRIOR_Zw_m  = -0.18;   PRIOR_Zww_m = -0.043; % heave/D1 OE
+PRIOR_G1     =  0.0;   PRIOR_tau_p =  44.0;   % avg unsaturated regimes P0-P3, B1-B2
+PRIOR_G2     =  0.0;   PRIOR_tau_q =  57.0;   % avg unsaturated regimes P0-P3, B1-B2
+PRIOR_G3     =  0.0;   PRIOR_tau_r =  29.7;   % avg P0+P1 yaw OE
+PRIOR_Lp     = -19.0;  % avg unsaturated regimes P0-P3, B1-B2
+PRIOR_Mq     = -24.0;  % avg unsaturated regimes P0-P3, B1-B2
+PRIOR_Nr     = -13.5;  % very consistent across all regimes
 
 switch excite_axis
 
-    % ── ROLL: free = [Lp, Gamma1, tau_p] ────────────────────────────────────
+    % ── ROLL: free = [Lp, tau_p] ─────────────────────────────────────────────
     case 'roll'
         % p-equation: pdot = Lp*p + Gamma1*q*r + tau_p*cmd_roll
         %
-        % Lp < 0 is roll-rate aerodynamic damping — essential for the model
-        % to represent p returning to zero after a step input. Without it,
-        % lesq conflates damping with tau_p and produces a badly biased estimate.
+        % Gamma1 = (Iyy-Izz)/Ixx is NOT identifiable from roll tests because
+        % q*r is near-zero during pure roll excitation. lesq produces wildly
+        % varying estimates (e.g. -14125 at B3). Fix Gamma1=0 and only
+        % identify [Lp, tau_p].
         %
-        % Constraint: Lp < 0 (damping must oppose rotation)
+        % Lp < 0: roll-rate aerodynamic damping
+        % tau_p > 0: roll control effectiveness (confirmed positive by data)
         z_p   = pdot;
-        Phi_p = [p_e,  q_e.*r_e,  cr];
-        lb_p  = [-Inf; -Inf; -Inf];
-        ub_p  = [-1e-4; Inf; Inf];   % Lp strictly negative
+        Phi_p = [p_e,  cr];           % only Lp and tau_p regressors
+        lb_p  = [-Inf; 1e-4];         % tau_p > 0
+        ub_p  = [-1e-4; Inf];         % Lp strictly negative
         pp    = lsqlin(Phi_p, z_p, [], [], [], [], lb_p, ub_p, [], lsq_opts);
         Lp_hat     = pp(1);
-        Gamma1_hat = pp(2);
-        tau_p_hat  = pp(3);
-        fprintf('p-eq:  Lp=%.5f  Gamma1=%.5f  tau_p=%.5f\n', ...
+        Gamma1_hat = PRIOR_G1;        % fixed to 0 — not identifiable
+        tau_p_hat  = pp(2);
+        fprintf('p-eq:  Lp=%.5f  Gamma1 fixed=%.5f  tau_p=%.5f\n', ...
                 Lp_hat, Gamma1_hat, tau_p_hat);
 
-        p0_free    = [Lp_hat; Gamma1_hat; tau_p_hat];
-        free_names = {'Lp','Gamma1','tau_p'};
+        p0_free    = [Lp_hat; tau_p_hat];
+        free_names = {'Lp','tau_p'};
 
-    % ── PITCH: free = [Mq, Gamma2, tau_q, Xu_m, Tmax_m, Zw_m] ──────────────
+    % ── PITCH: free = [Mq, tau_q, Xu_m] ─────────────────────────────────────
+    % Gamma2 = (Izz-Ixx)/Iyy is NOT identifiable from pitch tests because
+    % p*r is near-zero during pure pitch excitation. lesq produces wildly
+    % varying estimates. Fix Gamma2=0, only identify [Mq, tau_q, Xu_m].
+    %
+    % Tmax_m and Zw_m are fixed to heave/drop prior values.
+    %
+    % Xu_m at hover (P0) is essentially unidentifiable since vx_b ≈ 0.
+    % At P0 we skip Xu_m identification and use the prior from P1.
     case 'pitch'
-        % q-equation: qdot = Mq*q + Gamma2*p*r + tau_q*cmd_pitch
-        % Mq < 0 is pitch-rate aerodynamic damping
+        % q-equation: qdot = Mq*q + tau_q*cmd_pitch
+        % Gamma2 fixed to 0 — not identifiable from pitch test
         z_q   = qdot;
-        Phi_q = [q_e,  p_e.*r_e,  cp_];
-        lb_q  = [-Inf; -Inf; -Inf];
-        ub_q  = [-1e-4; Inf; Inf];   % Mq strictly negative
+        Phi_q = [q_e,  cp_];          % only Mq and tau_q regressors
+        lb_q  = [-Inf; 1e-4];         % tau_q > 0 after q_e sign correction
+        ub_q  = [-1e-4; Inf];         % Mq strictly negative
         pq    = lsqlin(Phi_q, z_q, [], [], [], [], lb_q, ub_q, [], lsq_opts);
         Mq_hat     = pq(1);
-        Gamma2_hat = pq(2);
-        tau_q_hat  = pq(3);
-        fprintf('q-eq:  Mq=%.5f  Gamma2=%.5f  tau_q=%.5f\n', ...
+        Gamma2_hat = PRIOR_G2;        % fixed to 0 — not identifiable
+        tau_q_hat  = pq(2);
+        fprintf('q-eq:  Mq=%.5f  Gamma2 fixed=%.5f  tau_q=%.5f\n', ...
                 Mq_hat, Gamma2_hat, tau_q_hat);
 
-        % u-equation (Xu_m only — Xuu_m fixed 0)
-        z_u   = udot - (r_e.*vy_b - q_e.*vz_b) + g.*sin(the_e);
-        Phi_u = vx_b;
-        Xu_m_hat = lsqlin(Phi_u, z_u, [], [], [], [], -Inf, -1e-6, [], lsq_opts);
-        fprintf('u-eq:  Xu_m=%.5f\n', Xu_m_hat);
+        % u-equation: Xu_m only (Xuu_m fixed 0)
+        % Skip at hover (theta0 ≈ 0) where vx_b ≈ 0 makes Xu_m unidentifiable.
+        % Use prior value from P1 instead.
+        % Skip Xu_m identification when trim pitch is near hover (|theta0| < 10 deg)
+        % because vx_b ≈ 0 at hover makes Xu_m unidentifiable — OE wanders.
+        % Use theta0_tgt (the intended trim angle) not mean(the_e) which
+        % oscillates around theta0 during excitation and gives wrong result.
+        if abs(theta0_tgt) < deg2rad(10)
+            Xu_m_hat = PRIOR_Xu_m;
+            fprintf('u-eq:  Xu_m fixed to prior=%.5f (|theta0|<10 deg — vx_b too small)\n', Xu_m_hat);
+        else
+            z_u   = udot - (r_e.*vy_b - q_e.*vz_b) + g.*sin(the_e);
+            Phi_u = vx_b;
+            Xu_m_hat = lsqlin(Phi_u, z_u, [], [], [], [], -Inf, -1e-6, [], lsq_opts);
+            fprintf('u-eq:  Xu_m=%.5f\n', Xu_m_hat);
+        end
 
-        % w-equation (Tmax_m, Zw_m — Zww_m fixed 0)
-        z_w   = wdot - (q_e.*vx_b - p_e.*vy_b) - g.*cos(the_e).*cos(phi_e);
-        Phi_w = [-ct,  vz_b];
-        lb_w  = [1e-6; -Inf];   ub_w = [Inf; -1e-6];
-        pw    = lsqlin(Phi_w, z_w, [], [], [], [], lb_w, ub_w, [], lsq_opts);
-        Tmax_m_hat = pw(1);
-        Zw_m_hat   = pw(2);
-        fprintf('w-eq:  Tmax_m=%.5f  Zw_m=%.5f\n', Tmax_m_hat, Zw_m_hat);
+        fprintf('fixed:  Tmax_m=%.5f  Zw_m=%.5f  Gamma2=%.5f\n', ...
+                PRIOR_Tmax_m, PRIOR_Zw_m, Gamma2_hat);
 
-        p0_free    = [Mq_hat; Gamma2_hat; tau_q_hat; Xu_m_hat; Tmax_m_hat; Zw_m_hat];
-        free_names = {'Mq','Gamma2','tau_q','Xu_m','Tmax_m','Zw_m'};
+        % At hover (|theta0| < 10 deg), vx_b ≈ 0 so OE cannot determine Xu_m.
+        % Exclude Xu_m from p0_free entirely so the optimizer cannot move it.
+        % Setting it as an initial value is not sufficient — OE will still
+        % wander on the flat vx_b cost surface and produce nonsense values.
+        if abs(theta0_tgt) < deg2rad(10)
+            p0_free    = [Mq_hat; tau_q_hat];
+            free_names = {'Mq','tau_q'};
+        else
+            p0_free    = [Mq_hat; tau_q_hat; Xu_m_hat];
+            free_names = {'Mq','tau_q','Xu_m'};
+        end
 
     % ── YAW: free = [Nr, Gamma3, tau_r] ─────────────────────────────────────
     case 'yaw'
         % r-equation: rdot = Nr*r + Gamma3*p*q + tau_r*cmd_yaw
-        % Nr < 0 is yaw-rate aerodynamic damping
+        % Nr < 0 is yaw-rate aerodynamic damping.
+        %
+        % Gamma3 = (Ixx-Iyy)/Izz is NOT identifiable from yaw tests because
+        % p*q is near-zero during a pure yaw excitation at any trim condition.
+        % lesq produces wildly varying estimates (e.g. -8383 at P1).
+        % Fix Gamma3 = 0 (symmetric quadrotor assumption) and only identify
+        % Nr and tau_r. OE will be given a very tight prior on Gamma3 so it
+        % cannot move from zero regardless of cost surface shape.
         z_r   = rdot;
-        Phi_r = [r_e,  p_e.*q_e,  cy];
-        lb_r  = [-Inf; -Inf; -Inf];
-        ub_r  = [-1e-4; Inf; Inf];   % Nr strictly negative
+        Phi_r = [r_e,  cy];          % only Nr and tau_r regressors
+        lb_r  = [-Inf; -Inf];
+        ub_r  = [-1e-4; Inf];        % Nr strictly negative
         pr    = lsqlin(Phi_r, z_r, [], [], [], [], lb_r, ub_r, [], lsq_opts);
         Nr_hat     = pr(1);
-        Gamma3_hat = pr(2);
-        tau_r_hat  = pr(3);
-        fprintf('r-eq:  Nr=%.5f  Gamma3=%.5f  tau_r=%.5f\n', ...
+        Gamma3_hat = PRIOR_G3;       % fixed to 0 — not identifiable from yaw test
+        tau_r_hat  = pr(2);
+        fprintf('r-eq:  Nr=%.5f  Gamma3 fixed=%.5f  tau_r=%.5f\n', ...
                 Nr_hat, Gamma3_hat, tau_r_hat);
 
         p0_free    = [Nr_hat; Gamma3_hat; tau_r_hat];
@@ -274,8 +344,31 @@ switch excite_axis
         p0_free    = [Tmax_m_hat; Zw_m_hat; Zww_m_hat];
         free_names = {'Tmax_m','Zw_m','Zww_m'};
 
+    % ── LATERAL: free = [Yv_m, Yvv_m] ──────────────────────────────────────
+    % Excited by bank-step sequence that generates lateral body velocity vy_b.
+    % Yv_m < 0: linear lateral drag
+    % Yvv_m < 0: quadratic lateral drag (only identifiable at vy_b > 3 m/s)
+    %
+    % SIGN CONVENTION: vy_b in this simulator is measured with OPPOSITE sign
+    % to standard NED body-y (positive = leftward). The correct dynamics are:
+    %   vdot = -(p*vz_b - r*vx_b) - g*cos(θ)*sin(φ) + Yv_m*v + Yvv_m*v*|v|
+    % Residual after subtracting forcing terms:
+    %   z_v = vdot + (p*vz_b - r*vx_b) + g*cos(θ)*sin(φ)
+    case 'lateral'
+        z_v   = vdot + (p_e.*vz_b - r_e.*vx_b) + g.*cos(the_e).*sin(phi_e);
+        Phi_v = [vy_b,  vy_b.*abs(vy_b)];
+        lb_v  = [-Inf; -Inf];
+        ub_v  = [-1e-6; -1e-6];   % both must be strictly negative
+        pv    = lsqlin(Phi_v, z_v, [], [], [], [], lb_v, ub_v, [], lsq_opts);
+        Yv_m_hat   = pv(1);
+        Yvv_m_hat  = pv(2);
+        fprintf('v-eq:  Yv_m=%.5f  Yvv_m=%.5f\n', Yv_m_hat, Yvv_m_hat);
+
+        p0_free    = [Yv_m_hat; Yvv_m_hat];
+        free_names = {'Yv_m','Yvv_m'};
+
     otherwise
-        error('Unknown excite_axis: %s  (valid: roll|pitch|yaw|heave|drop)', excite_axis);
+        error('Unknown excite_axis: %s  (valid: roll|pitch|yaw|heave|drop|lateral)', excite_axis);
 end
 
 fprintf('\nlesq free params:\n');
@@ -293,23 +386,30 @@ end
 switch excite_axis
     case 'roll'
         % States: [p_rate, phi]
+        % Gamma1 removed from free params — p0_free is now [Lp, tau_p]
         x0_oe  = [p_e(1); phi_e(1)];
         z_oe   = [p_e,  phi_e];
         u_oe   = [cr,  q_e,  r_e,  the_e];   % [N x 4]
         axis_code = 1;
 
     case 'pitch'
-        % States: [q_rate, theta, vx_b, vz_b]
-        x0_oe  = [q_e(1); the_e(1); vx_b(1); vz_b(1)];
-        z_oe   = [q_e,  the_e,  vx_b,  vz_b];
-        u_oe   = [cp_,  ct,  p_e,  r_e,  phi_e];   % [N x 5]
+        % States: [q_rate, theta, vx_b]
+        % vz_b is NOT a state but IS passed as exogenous input (col 5) so the
+        % Coriolis term -q*vz_b in udot is correctly captured.
+        % vy_b is also passed (col 6) for the r*vy_b Coriolis term, which is
+        % significant for B/C regimes where vy_b is nonzero at trim.
+        x0_oe  = [q_e(1); the_e(1); vx_b(1)];
+        z_oe   = [q_e,  the_e,  vx_b];
+        u_oe   = [cp_,  p_e,  r_e,  phi_e,  vz_b,  vy_b];   % [N x 6]
         axis_code = 2;
 
     case 'yaw'
         % States: [r_rate, psi]
+        % phi_e and the_e passed as exogenous inputs so psidot is computed
+        % correctly in banked/pitched regimes (B/C) instead of using phi=theta=0.
         x0_oe  = [r_e(1); psi_e(1)];
         z_oe   = [r_e,  psi_e];
-        u_oe   = [cy,  p_e,  q_e];   % [N x 3]
+        u_oe   = [cy,  p_e,  q_e,  phi_e,  the_e];   % [N x 5]
         axis_code = 3;
 
     case {'heave','drop'}
@@ -318,6 +418,15 @@ switch excite_axis
         z_oe   = vz_b(:);            % [N x 1] column
         u_oe   = ct(:);              % [N x 1]
         axis_code = 4;
+
+    case 'lateral'
+        % States: [vy_b]
+        % All Coriolis and gravity forcing terms are exogenous — only Yv_m
+        % and Yvv_m are free. phi_e provides the gravity excitation forcing.
+        x0_oe  = vy_b(1);
+        z_oe   = vy_b(:);            % [N x 1] column
+        u_oe   = [phi_e,  the_e,  p_e,  r_e,  vx_b,  vz_b];   % [N x 6]
+        axis_code = 5;
 end
 
 % =============================================================================
@@ -346,9 +455,15 @@ x0_oe_sc = x0_oe(:);               % physical units — dsname scales output
 fprintf('Output RMS scales: ');
 fprintf('%.4f ', z_scale);  fprintf('\n');
 
-% c passed as row vector [g, axis_code, z_scale...] — z_scale appended so
-% drone_statespace_reduced can normalise its output to match z_oe_sc.
-c_oe = [g, axis_code, z_scale];
+% c passed as row vector [g, axis_code, z_scale..., extra_constants]
+% For pitch: append PRIOR_Tmax_m, PRIOR_Zw_m, and PRIOR_Xu_m as fixed constants
+% so drone_statespace_reduced always has Xu_m available regardless of whether
+% it is in p0_free (non-hover) or fixed (hover).
+if strcmp(excite_axis, 'pitch')
+    c_oe = [g, axis_code, z_scale, PRIOR_Tmax_m, PRIOR_Zw_m, PRIOR_Xu_m];
+else
+    c_oe = [g, axis_code, z_scale];
+end
 
 % =============================================================================
 % 9. crb0 — tight priors anchored to lesq estimates
@@ -360,27 +475,35 @@ c_oe = [g, axis_code, z_scale];
 % =============================================================================
 switch excite_axis
     case 'roll'
-        sig_free = [abs(p0_free(1)) * 0.05;       % Lp     — 5% (may be small)
-                    1.0;                           % Gamma1 — wide, near zero
-                    abs(p0_free(3)) * 0.02];       % tau_p  — 2% tight
+        % 2 free params: [Lp, tau_p] — Gamma1 fixed to 0
+        sig_free = [abs(p0_free(1)) * 0.05;       % Lp     — 5%
+                    abs(p0_free(2)) * 0.02];       % tau_p  — 2%
 
     case 'pitch'
+        % 3 free params: [Mq, tau_q, Xu_m] — at non-hover
+        % 2 free params: [Mq, tau_q]        — at hover (Xu_m excluded)
         sig_free = [abs(p0_free(1)) * 0.05;       % Mq     — 5%
-                    1.0;                           % Gamma2 — wide
-                    abs(p0_free(3)) * 0.02;       % tau_q  — 2%
-                    abs(p0_free(4)) * 0.02;       % Xu_m   — 2%
-                    abs(p0_free(5)) * 0.02;       % Tmax_m — 2%
-                    abs(p0_free(6)) * 0.02];      % Zw_m   — 2%
+                    abs(p0_free(2)) * 0.02];       % tau_q  — 2%
+        if length(p0_free) == 3
+            sig_free(3) = abs(p0_free(3)) * 0.10; % Xu_m   — 10%
+        end
 
     case 'yaw'
-        sig_free = [abs(p0_free(1)) * 0.05;       % Nr     — 5%
-                    1.0;                           % Gamma3 — wide
-                    abs(p0_free(3)) * 0.02];       % tau_r  — 2%
+        % Gamma3 fixed to 0 — tight prior prevents OE from moving it.
+        % p0_free(2) = PRIOR_G3 = 0, so we use an absolute sigma of 0.01.
+        sig_free = [abs(p0_free(1)) * 0.05;       % Nr      — 5%
+                    0.01;                          % Gamma3  — TIGHT (not identifiable)
+                    abs(p0_free(3)) * 0.02];       % tau_r   — 2%
 
     case {'heave','drop'}
-        sig_free = [abs(p0_free(1)) * 0.02;      % Tmax_m
-                    abs(p0_free(2)) * 0.02;       % Zw_m
-                    max(abs(p0_free(3)), 0.1) * 0.10];  % Zww_m (may be ~0)
+        % Loosen Tmax_m to 10% — lesq estimate can be biased at extreme thrust
+        sig_free = [abs(p0_free(1)) * 0.10;      % Tmax_m — 10% (loosened)
+                    abs(p0_free(2)) * 0.10;       % Zw_m   — 10% (very small value)
+                    max(abs(p0_free(3)), 0.01) * 0.10]; % Zww_m — 10%
+
+    case 'lateral'
+        sig_free = [abs(p0_free(1)) * 0.10;                  % Yv_m  — 10%
+                    max(abs(p0_free(2)), 0.005) * 0.15];      % Yvv_m — 15% (small value)
 end
 sig_free = max(sig_free, 1e-4);   % guard against exact-zero lesq params
 crb0     = diag(sig_free.^2);
@@ -445,16 +568,22 @@ p_full = [PRIOR_Xu_m; PRIOR_Xuu_m; PRIOR_Yv_m; PRIOR_Yvv_m;
 %  14=Lp 15=Mq 16=Nr
 switch excite_axis
     case 'roll'
+        % 2 free params: [Lp, tau_p]
         p_full(14) = p_oe_free(1);   % Lp
-        p_full(8)  = p_oe_free(2);   % Gamma1
-        p_full(9)  = p_oe_free(3);   % tau_p
+        p_full(9)  = p_oe_free(2);   % tau_p
+        p_full(8)  = PRIOR_G1;       % Gamma1 — fixed to 0
     case 'pitch'
+        % 3 free params at non-hover: [Mq, tau_q, Xu_m]
+        % 2 free params at hover:     [Mq, tau_q]  (Xu_m fixed to prior)
         p_full(15) = p_oe_free(1);   % Mq
-        p_full(10) = p_oe_free(2);   % Gamma2
-        p_full(11) = p_oe_free(3);   % tau_q
-        p_full(1)  = p_oe_free(4);   % Xu_m
-        p_full(5)  = p_oe_free(5);   % Tmax_m
-        p_full(6)  = p_oe_free(6);   % Zw_m
+        p_full(11) = p_oe_free(2);   % tau_q
+        if length(p_oe_free) >= 3
+            p_full(1) = p_oe_free(3);   % Xu_m — non-hover only
+        end
+        % else p_full(1) stays at PRIOR_Xu_m set at initialisation above
+        p_full(10) = PRIOR_G2;       % Gamma2 — fixed to 0
+        p_full(5)  = PRIOR_Tmax_m;   % fixed from heave
+        p_full(6)  = PRIOR_Zw_m;     % fixed from heave/drop
     case 'yaw'
         p_full(16) = p_oe_free(1);   % Nr
         p_full(12) = p_oe_free(2);   % Gamma3
@@ -463,25 +592,34 @@ switch excite_axis
         p_full(5)  = p_oe_free(1);   % Tmax_m
         p_full(6)  = p_oe_free(2);   % Zw_m
         p_full(7)  = p_oe_free(3);   % Zww_m
+    case 'lateral'
+        p_full(3)  = p_oe_free(1);   % Yv_m
+        p_full(4)  = p_oe_free(2);   % Yvv_m
 end
 
 % Well-identified flags: only free params can be well-identified
 % Criterion: std/|value| < 0.5
-well_id = false(13,1);
+well_id = false(16,1);   % 16 params — matches NP in drone_sysid_main.m
 for i = 1:length(p0_free)
     val = p_oe_free(i);
     std_i = sqrt(crb_oe_free(i,i));
     if abs(val) > 1e-6 && std_i/abs(val) < 0.5
-        % Map back to full index
+        % Map free-param index i back to full 16-element param vector index
         switch excite_axis
             case 'roll'
-                full_idx = [14, 8, 9];
+                full_idx = [14, 9];         % Lp, tau_p
             case 'pitch'
-                full_idx = [15, 10, 11, 1, 5, 6];
+                if length(p0_free) == 3
+                    full_idx = [15, 11, 1]; % Mq, tau_q, Xu_m (non-hover)
+                else
+                    full_idx = [15, 11];    % Mq, tau_q only (hover)
+                end
             case 'yaw'
                 full_idx = [16, 12, 13];
             case {'heave','drop'}
                 full_idx = [5, 6, 7];
+            case 'lateral'
+                full_idx = [3, 4];   % Yv_m, Yvv_m
         end
         well_id(full_idx(i)) = true;
     end
@@ -491,16 +629,23 @@ end
 crb_full = eye(16) * 25.0;   % prior uncertainty for non-excited params
 switch excite_axis
     case 'roll'
-        idx = [14, 8, 9];
+        idx = [14, 9];   % Lp, tau_p
         crb_full(idx,idx) = crb_oe_free;
     case 'pitch'
-        idx = [15, 10, 11, 1, 5, 6];
+        if length(p0_free) == 3
+            idx = [15, 11, 1];   % Mq, tau_q, Xu_m (non-hover)
+        else
+            idx = [15, 11];      % Mq, tau_q only (hover — Xu_m stays at prior)
+        end
         crb_full(idx,idx) = crb_oe_free;
     case 'yaw'
         idx = [16, 12, 13];
         crb_full(idx,idx) = crb_oe_free;
     case {'heave','drop'}
         idx = [5, 6, 7];
+        crb_full(idx,idx) = crb_oe_free;
+    case 'lateral'
+        idx = [3, 4];   % Yv_m, Yvv_m
         crb_full(idx,idx) = crb_oe_free;
 end
 
@@ -510,9 +655,10 @@ end
 if DO_PLOT
     switch excite_axis
         case 'roll';   state_labels = {'p (rad/s)', '\phi (rad)'};
-        case 'pitch';  state_labels = {'q (rad/s)', '\theta (rad)', 'u_b (m/s)', 'w_b (m/s)'};
+        case 'pitch';  state_labels = {'q (rad/s)', '\theta (rad)', 'u_b (m/s)'};
         case 'yaw';    state_labels = {'r (rad/s)', '\psi (rad)'};
         case {'heave','drop'};  state_labels = {'w_b (m/s)'};
+        case 'lateral';         state_labels = {'v_b (m/s)'};
     end
 
     ns = size(z_oe, 2);
