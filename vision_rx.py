@@ -115,12 +115,26 @@ def _extract_gate_corners(img, contour):
     Returns (4, 2) float32 ordered [TL, TR, BR, BL] in image coords, or None.
 
     Strategy: convex hull collapses the hollow frame into its 4 outer vertices,
-    then approxPolyDP simplifies to a quad. cornerSubPix refines to sub-pixel.
+    then approxPolyDP with several epsilon candidates simplifies to a quad.
+    Rejects gates that touch the image border (clipped hull → bad corners).
     """
+    # Skip PnP when the gate is clipped by the image border — the convex hull
+    # will be missing one or more corners, producing a bogus quad.
+    x, y, w, h = cv2.boundingRect(contour)
+    if x <= 1 or y <= 1 or (x + w) >= IMG_W - 2 or (y + h) >= IMG_H - 2:
+        return None
+
     hull  = cv2.convexHull(contour)
     peri  = cv2.arcLength(hull, True)
-    approx = cv2.approxPolyDP(hull, 0.05 * peri, True)
-    if len(approx) != 4:
+
+    # Try progressively looser epsilons; take the first that gives exactly 4 pts.
+    approx = None
+    for eps in (0.03, 0.05, 0.08, 0.12):
+        cand = cv2.approxPolyDP(hull, eps * peri, True)
+        if len(cand) == 4:
+            approx = cand
+            break
+    if approx is None:
         return None
     pts = approx.reshape(4, 2).astype(np.float32)
 
@@ -379,6 +393,7 @@ class VisionRX:
         self._proc_count = 0
         self._dump_sets  = 0
         self._ema_prev   = None     # previous smoothed bbox (EMA state)
+        self._pnp_ema    = None     # (tvec, gate_id) — PnP tvec EMA state
         # Clear last run's dumped frames so vision_dump/ always matches the
         # freshly-rewritten vision_log.csv. Frame IDs restart at 0 each run, so
         # leftover frames would silently bind to the WRONG run's pose and corrupt
@@ -485,6 +500,23 @@ class VisionRX:
         # gate-switches. Instrumentation above logs the RAW detection, so offline
         # scoring still sees unsmoothed detections.
         estimate, self._ema_prev = ema_smooth(self._ema_prev, estimate)
+
+        # PnP tvec EMA: light smoothing between frames when the same gate is tracked.
+        # Resets on gate-switch (target_gate changes) or when PnP is not available.
+        # Alpha=0.4 → heavier weight on new measurement than bbox EMA (0.5) because
+        # PnP is already accurate enough that smoothing is just for jitter, not drift.
+        PNP_EMA_ALPHA = 0.4
+        if estimate is not None and estimate.get('pnp_ok'):
+            cur_gate = estimate.get('target_gate')
+            new_tvec = estimate['pnp_tvec'].copy()
+            if (self._pnp_ema is not None
+                    and self._pnp_ema[1] == cur_gate):
+                prev_tvec = self._pnp_ema[0]
+                smoothed  = PNP_EMA_ALPHA * new_tvec + (1 - PNP_EMA_ALPHA) * prev_tvec
+                estimate['pnp_tvec'] = smoothed
+            self._pnp_ema = (estimate['pnp_tvec'].copy(), cur_gate)
+        else:
+            self._pnp_ema = None
 
         # Add telemetry-free body-relative pose fields to the smoothed estimate.
         # These allow Round-2 controllers to steer without attitude/position data.
