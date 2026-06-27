@@ -70,8 +70,11 @@ UPPER_RED_1 = np.array([10,  255, 255])
 LOWER_RED_2 = np.array([170, 120,  50])
 UPPER_RED_2 = np.array([180, 255, 255])
 
-# Minimum contour area (px²) to be considered a gate detection
-MIN_CONTOUR_AREA = 800
+# Minimum contour area (px²) to be considered a reliable gate detection.
+# Lowered from 800 → 500 to catch gate frames that are split into smaller
+# blobs by the 7×7 morphology at oblique approach angles (15-25m range).
+# The simulator has no non-gate red objects, so false positives are minimal.
+MIN_CONTOUR_AREA = 500
 
 # --- Partial / edge-exit rejection -----------------------------------------
 # As the drone passes THROUGH a gate, the red frame breaks into a partial sliver
