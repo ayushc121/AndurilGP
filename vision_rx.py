@@ -38,12 +38,25 @@ _GATE_OBJ_PTS = np.array([
     [ _GATE_HALF, -_GATE_HALF, 0.0],        # BR
     [-_GATE_HALF, -_GATE_HALF, 0.0],        # BL
 ], dtype=np.float32)
+
+# Inner opening corners (spec §3.7: 1500 × 1500 mm inner square, half = 0.75 m).
+# Same [TL, TR, BR, BL] order as outer.
+_GATE_INNER_HALF = 0.75
+_GATE_INNER_OBJ  = np.array([
+    [-_GATE_INNER_HALF,  _GATE_INNER_HALF, 0.0],
+    [ _GATE_INNER_HALF,  _GATE_INNER_HALF, 0.0],
+    [ _GATE_INNER_HALF, -_GATE_INNER_HALF, 0.0],
+    [-_GATE_INNER_HALF, -_GATE_INNER_HALF, 0.0],
+], dtype=np.float32)
+
+# 8-point combined object array: outer 4 followed by inner 4.
+_GATE_OBJ_8   = np.vstack([_GATE_OBJ_PTS, _GATE_INNER_OBJ])
+
 _CAM_K    = np.array([[FX, 0, CX], [0, FY, CY], [0, 0, 1.0]], dtype=np.float32)
 _CAM_DIST = np.zeros((4, 1), dtype=np.float32)          # spec: no distortion
 _HAS_IPPE = hasattr(cv2, 'SOLVEPNP_IPPE_SQUARE')        # OpenCV >= 3.4.5
 
 # Reject a PnP solve whose RMS reprojection error exceeds this threshold.
-# Tightened per-range in _solve_gate_pnp; this is the hard ceiling.
 PNP_MAX_REPROJ_PX = 12.0
 
 # --------------------------------------------------------------------------------------
@@ -109,53 +122,100 @@ DUMP_MAX_SETS    = 400     # stop dumping after this many sets (disk-flood guard
 INSTR_AREA_FLOOR = 100     # log/draw contours down to this area (below MIN_CONTOUR_AREA)
 
 
-def _extract_gate_corners(img, contour):
-    """
-    Extract 4 gate corners from the outer red contour.
-    Returns (4, 2) float32 ordered [TL, TR, BR, BL] in image coords, or None.
-
-    Strategy: convex hull collapses the hollow frame into its 4 outer vertices,
-    then approxPolyDP with several epsilon candidates simplifies to a quad.
-    Rejects gates that touch the image border (clipped hull → bad corners).
-    """
-    # Skip PnP when the gate is clipped by the image border — the convex hull
-    # will be missing one or more corners, producing a bogus quad.
-    x, y, w, h = cv2.boundingRect(contour)
-    if x <= 1 or y <= 1 or (x + w) >= IMG_W - 2 or (y + h) >= IMG_H - 2:
-        return None
-
-    hull  = cv2.convexHull(contour)
-    peri  = cv2.arcLength(hull, True)
-
-    # Try progressively looser epsilons; take the first that gives exactly 4 pts.
-    approx = None
-    for eps in (0.03, 0.05, 0.08, 0.12):
-        cand = cv2.approxPolyDP(hull, eps * peri, True)
-        if len(cand) == 4:
-            approx = cand
-            break
-    if approx is None:
-        return None
-    pts = approx.reshape(4, 2).astype(np.float32)
-
-    # Sub-pixel refinement on grayscale — strong gradients at gate edges.
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1)
-    try:
-        cv2.cornerSubPix(gray, pts, (7, 7), (-1, -1), crit)
-    except Exception:
-        pass
-
-    # Order as [TL, TR, BR, BL] for IPPE_SQUARE:
-    # TL = smallest x+y, BR = largest x+y, TR = smallest y-x, BL = largest y-x.
+def _order_quad(pts):
+    """Return (4, 2) float32 in [TL, TR, BR, BL] order for IPPE_SQUARE."""
     s = pts.sum(axis=1)
     d = np.diff(pts, axis=1).flatten()
     return np.array([
-        pts[np.argmin(s)],
-        pts[np.argmin(d)],
-        pts[np.argmax(s)],
-        pts[np.argmax(d)],
+        pts[np.argmin(s)],   # TL: smallest x+y
+        pts[np.argmin(d)],   # TR: smallest y−x
+        pts[np.argmax(s)],   # BR: largest x+y
+        pts[np.argmax(d)],   # BL: largest y−x
     ], dtype=np.float32)
+
+
+def _approx_quad(contour, epsilons=(0.03, 0.05, 0.08, 0.12)):
+    """Try increasing approxPolyDP epsilons; return (4,2) float32 or None."""
+    hull = cv2.convexHull(contour)
+    peri = cv2.arcLength(hull, True)
+    for eps in epsilons:
+        cand = cv2.approxPolyDP(hull, eps * peri, True)
+        if len(cand) == 4:
+            return cand.reshape(4, 2).astype(np.float32)
+    return None
+
+
+def _extract_gate_corners(img, contour, mask):
+    """
+    Extract outer + inner gate corners from the outer red contour and the mask.
+    Returns (outer_4, inner_4_or_None). outer_4 is None if the gate is clipped
+    or no quad can be found.
+
+    Outer corners  → ±1.35 m object points (outer gate frame).
+    Inner corners  → ±0.75 m object points (inner opening edge), found via the
+                     RETR_CCOMP hole contour inside the red-frame mask.
+    Both ordered [TL, TR, BR, BL] for IPPE_SQUARE / 8-pt solvePnP.
+    """
+    # Reject clipped gates — the convex hull is missing corners.
+    gx, gy, gw, gh = cv2.boundingRect(contour)
+    if gx <= 1 or gy <= 1 or (gx + gw) >= IMG_W - 2 or (gy + gh) >= IMG_H - 2:
+        return None, None
+
+    outer_pts = _approx_quad(contour)
+    if outer_pts is None:
+        return None, None
+
+    # Sub-pixel refinement on grayscale edges.
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 30, 0.1)
+    try:
+        cv2.cornerSubPix(gray, outer_pts, (7, 7), (-1, -1), crit)
+    except Exception:
+        pass
+    outer_4 = _order_quad(outer_pts)
+
+    # Inner hole: RETR_CCOMP on a *fine* mask (3×3 morphology instead of 7×7).
+    # The standard detection mask uses 7×7 MORPH_CLOSE which fills the inner
+    # hole at range (inner opening is only ~16 px at 30 m).  Re-computing with
+    # a 3×3 kernel preserves the hole without affecting detection area / reliable.
+    inner_4 = None
+    try:
+        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+        _m1 = cv2.inRange(hsv, LOWER_RED_1, UPPER_RED_1)
+        _m2 = cv2.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
+        mask_fine = cv2.bitwise_or(_m1, _m2)
+        _k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        mask_fine = cv2.morphologyEx(mask_fine, cv2.MORPH_CLOSE, _k3)
+        mask_fine = cv2.morphologyEx(mask_fine, cv2.MORPH_OPEN,  _k3)
+        all_cnts, hier = cv2.findContours(mask_fine, cv2.RETR_CCOMP,
+                                          cv2.CHAIN_APPROX_SIMPLE)
+        if hier is not None:
+            hier = hier[0]
+            gate_area = cv2.contourArea(contour)
+            for i, h in enumerate(hier):
+                if h[3] == -1:           # skip outer boundaries
+                    continue
+                ix, iy, iw, ih = cv2.boundingRect(all_cnts[i])
+                # Must sit inside the outer gate bbox.
+                if ix < gx or iy < gy or ix + iw > gx + gw or iy + ih > gy + gh:
+                    continue
+                # Inner area should be 10–70 % of outer area.
+                iarea = cv2.contourArea(all_cnts[i])
+                if not (0.10 * gate_area < iarea < 0.70 * gate_area):
+                    continue
+                inner_pts = _approx_quad(all_cnts[i])
+                if inner_pts is None:
+                    continue
+                try:
+                    cv2.cornerSubPix(gray, inner_pts, (5, 5), (-1, -1), crit)
+                except Exception:
+                    pass
+                inner_4 = _order_quad(inner_pts)
+                break
+    except Exception:
+        pass
+
+    return outer_4, inner_4
 
 
 def _solve_gate_pnp(corners):
@@ -191,6 +251,30 @@ def _solve_gate_pnp(corners):
             err = float(np.mean(np.linalg.norm(
                 proj.reshape(4, 2) - corners.reshape(4, 2), axis=1)))
             return tvec.flatten(), rvec.flatten(), err
+    except Exception:
+        return None, None, float('inf')
+
+
+def _refine_pnp_8pt(outer_corners, inner_corners, init_rvec, init_tvec):
+    """
+    Refine a 4-corner IPPE result using all 8 corners (outer + inner).
+    The IPPE solution serves as the initial guess; ITERATIVE polishes it.
+    Returns (tvec, rvec, reproj_err) or the original (tvec_flat, rvec_flat, inf)
+    if refinement fails or produces a worse fit.
+    """
+    try:
+        all_img = np.vstack([outer_corners, inner_corners])
+        ok, rvec_r, tvec_r = cv2.solvePnP(
+            _GATE_OBJ_8, all_img, _CAM_K, _CAM_DIST,
+            rvec=init_rvec, tvec=init_tvec,
+            useExtrinsicGuess=True,
+            flags=cv2.SOLVEPNP_ITERATIVE)
+        if not ok or float(tvec_r[2, 0]) <= 0.3:
+            return None, None, float('inf')
+        proj, _ = cv2.projectPoints(_GATE_OBJ_8, rvec_r, tvec_r, _CAM_K, _CAM_DIST)
+        err = float(np.mean(np.linalg.norm(
+            proj.reshape(-1, 2) - all_img.reshape(-1, 2), axis=1)))
+        return tvec_r.flatten(), rvec_r.flatten(), err
     except Exception:
         return None, None, float('inf')
 
@@ -333,18 +417,26 @@ def detect_gate(img):
         'pnp_ok':    False,
     }
 
-    # PnP: extract 4 corners + solve for full 6-DoF gate-relative pose.
-    # Only attempted on reliable detections; falls back to bbox silently.
+    # PnP: extract corners + solve for full 6-DoF gate-relative pose.
+    # Uses 8 points (outer + inner) when the inner hole is detectable; falls
+    # back to 4-point IPPE when it isn't. Falls back to bbox silently.
     if reliable:
-        corners = _extract_gate_corners(img, best)
-        if corners is not None:
-            tvec, rvec, reproj = _solve_gate_pnp(corners)
+        outer_corners, inner_corners = _extract_gate_corners(img, best, mask)
+        if outer_corners is not None:
+            tvec, rvec, reproj = _solve_gate_pnp(outer_corners)
             if tvec is not None and reproj < PNP_MAX_REPROJ_PX:
+                if inner_corners is not None:
+                    tvec8, rvec8, reproj8 = _refine_pnp_8pt(
+                        outer_corners, inner_corners,
+                        rvec.reshape(3, 1), tvec.reshape(3, 1))
+                    if tvec8 is not None and reproj8 < PNP_MAX_REPROJ_PX:
+                        tvec, rvec, reproj = tvec8, rvec8, reproj8
+                        estimate['pnp_8pt'] = True
                 estimate['pnp_ok']      = True
-                estimate['pnp_tvec']    = tvec     # [cam_x_m, cam_y_m, cam_z_m]
+                estimate['pnp_tvec']    = tvec
                 estimate['pnp_rvec']    = rvec
                 estimate['pnp_reproj']  = reproj
-                estimate['pnp_corners'] = corners  # (4,2) for overlay
+                estimate['pnp_corners'] = outer_corners
 
     return estimate, mask, contours
 
