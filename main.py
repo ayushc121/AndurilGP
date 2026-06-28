@@ -2,9 +2,15 @@
 # AI Grand Prix — autonomous drone racing client
 #
 
+import argparse
 import time
 
 from setup import setup_components
+
+_parser = argparse.ArgumentParser()
+_parser.add_argument('--train', action='store_true',
+                     help='Use training controller (telemetry-guided, slow, logs to train_log.jsonl)')
+_args = _parser.parse_args()
 
 # Modify if connecting to a remote simulator
 SIM_SERVER_UDP_IP   = '127.0.0.1'
@@ -25,7 +31,12 @@ shared_data = {}
 components  = setup_components(
     shared_data, system_boot_ms, SIM_SERVER_UDP_IP, SIM_SERVER_UDP_PORT
 )
-controller  = components['controller']
+if _args.train:
+    from train_controller import TrainController
+    controller = TrainController(
+        components['sim_conn'], shared_data, system_boot_ms)
+else:
+    controller  = components['controller']
 ts_loop     = components['ts_loop']
 mavlink_rx  = components['mavlink_rx']
 vision_rx   = components['vision_rx']
