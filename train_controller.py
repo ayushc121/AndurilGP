@@ -239,7 +239,17 @@ class TrainController:
         if gates:
             active_idx = race_status['active_gate_index'] if race_status else -1
 
-            # Gate advanced — log pass
+            # Course complete — must check before indexing gates[active_idx]
+            if active_idx >= n:
+                if self._current_gate_idx is not None:
+                    elapsed = round(time.time() - self._gate_approach_t, 2)
+                    print(f'[TRAIN] Gate {self._current_gate_idx} passed in {elapsed}s', flush=True)
+                    self._log('gate_pass', gate_idx=self._current_gate_idx, elapsed_s=elapsed)
+                print('[TRAIN] Course complete!', flush=True)
+                self._log('course_complete', gates_passed=n)
+                self._exit('course_complete')
+
+            # Gate advanced — log pass and set new target
             if active_idx != self._current_gate_idx and active_idx >= 0:
                 if self._current_gate_idx is not None:
                     elapsed = round(time.time() - self._gate_approach_t, 2)
@@ -260,11 +270,6 @@ class TrainController:
             if active_idx > self._wp:
                 self._wp = active_idx
             self._wp = max(0, min(self._wp, n-1))
-
-            if active_idx >= n:
-                print('[TRAIN] Course complete!', flush=True)
-                self._log('course_complete', gates_passed=active_idx)
-                self._exit('course_complete')
 
             ga      = gates[self._wp]
             g_north =  ga['pos_x']
