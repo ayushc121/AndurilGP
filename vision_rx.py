@@ -74,7 +74,7 @@ UPPER_RED_2 = np.array([180, 255, 255])
 # Lowered from 800 → 500 to catch gate frames that are split into smaller
 # blobs by the 7×7 morphology at oblique approach angles (15-25m range).
 # The simulator has no non-gate red objects, so false positives are minimal.
-MIN_CONTOUR_AREA = 500
+MIN_CONTOUR_AREA = 300
 
 # --- Partial / edge-exit rejection -----------------------------------------
 # As the drone passes THROUGH a gate, the red frame breaks into a partial sliver
@@ -358,8 +358,8 @@ def detect_gate(img):
     mask2 = cv2.inRange(hsv, LOWER_RED_2, UPPER_RED_2)
     mask  = cv2.bitwise_or(mask1, mask2)
 
-    # Morphological clean-up
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+    # Morphological clean-up — 3×3 preserves the ~4px gate border at 23m range
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     mask   = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
     mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel)
 
@@ -405,7 +405,8 @@ def detect_gate(img):
     # centred -> still reliable. A low gate clipped at the bottom (touches T/B AND
     # off-centre vertically) is a WEAK hint: real, but its size/centre are unreliable
     # for ranging -> use it only to servo-descend, not to steer.
-    reliable = (area >= MIN_CONTOUR_AREA) and not (touches_tb and off_centre_y)
+    # Large area = gate is close and definitely real; skip the low/clipped-band filter.
+    reliable = (area >= MIN_CONTOUR_AREA) and not (touches_tb and off_centre_y and area < 5000)
 
     estimate = {
         'cx':        cx,
