@@ -82,6 +82,7 @@ class Controller:
         self._wait_start_sim_ms = None
         self.prev_vy_err        = 0.0
         self.prev_vx_err        = 0.0
+        self._elev_des          = None   # rate-limited altitude setpoint, seeded on first tick
         print('Controller state reset.', flush=True)
 
     # ------------------------------------------------------------------
@@ -352,109 +353,70 @@ class Controller:
                 gate_pz = z_pos + (est_distance_3d * rw_z) + 1
             
             else:
-                g_north = 0
-                g_east = 0
-                gate_pz = -3
+                # No vision — hover in place; hold last altitude setpoint
+                g_north = x_pos
+                g_east  = y_pos
+                gate_pz = (self._elev_des + 1.0) if self._elev_des is not None else -3
 
             # ================================================================
-            # DESIRED PATH GENERATION
+            # DESIRED PATH GENERATION  (train_controller gains)
             # ----------------------------------------------------------------
 
-            V_MAX     = 20.0     # m/s horizontal cap
-            K_POS     = 1.7     # m/s per m of horizontal error
+            V_MAX = 3.0    # m/s — stable approach speed
+            K_POS = 0.3    # pos error → velocity setpoint
 
-            v_des_north = 0.0           # setpoints default to hover / hold when no gate
-            v_des_east  = 0.0
-            elev_des    = -3.0
+            ELEV_RAMP  = 1.5   # m/s max rate of change of altitude setpoint
+            ELEV_CLEAR = 1.0   # m above gate centre
 
             vec_n = g_north - x_pos
             vec_e = g_east  - y_pos
 
-            # Horizontal velocity setpoints (P on position, capped -> auto-slow in).
-            v_des_north = 35 * np.sign(vec_n) + float(np.clip(K_POS * vec_n, -V_MAX, V_MAX)) * 0.15
+            v_des_north = float(np.clip(K_POS * vec_n, -V_MAX, V_MAX))
             v_des_east  = float(np.clip(K_POS * vec_e, -V_MAX, V_MAX))
 
-            # Altitude: 
-            elev_des = gate_pz - 0.8
+            # Altitude: rate-limited setpoint toward vision estimate (1m above gate)
+            elev_target = gate_pz - ELEV_CLEAR
+            if self._elev_des is None:
+                self._elev_des = z_pos   # seed from current altitude on first tick
+            step = float(np.clip(elev_target - self._elev_des,
+                                 -ELEV_RAMP / CONTROL_HZ, ELEV_RAMP / CONTROL_HZ))
+            self._elev_des = float(np.clip(self._elev_des + step, -5.0, 28.0))
 
-            
             # ================================================================
-            # PID CONTROLLERS
+            # PID CONTROLLERS  (train_controller gains)
             # ----------------------------------------------------------------
 
-            # PITCH PID CONTROLLER
-            K_VX_P = 1.5           # deg of corrective pitch per m/s of north-speed error
-            K_VX_D = 0
-            PITCH_LIMIT = 50.0   # deg, max tilt
+            K_VX      = 2.0
+            K_VY      = 2.0
+            PITCH_LIMIT = 12.0
+            ROLL_LIMIT  = 12.0
 
-            vx_err = v_des_north - vx_world
-            d_vx_err = (vx_err - self.prev_vx_err) / dt
-
-            self.prev_vx_err = vx_err
-
-            pitch_des_raw = (K_VX_P * vx_err) + (K_VX_D * d_vx_err)
-
-            pitch_des = float(np.clip(pitch_des_raw, -PITCH_LIMIT, -20))
-
+            # PITCH
+            pitch_des = float(np.clip(K_VX * (v_des_north - vx_world), -PITCH_LIMIT, PITCH_LIMIT))
             K_P_pitch = 0.015
             K_D_pitch = 0.001
+            pitchCommand = K_P_pitch * (pitch_des - pitch_deg) - K_D_pitch * pitch_rate
 
-            err_pitch = pitch_des - pitch_deg
+            # ROLL
+            roll_des = float(np.clip(K_VY * (v_des_east - vy_world), -ROLL_LIMIT, ROLL_LIMIT))
+            K_P_roll = 0.015
+            K_D_roll = 0.001
+            rollCommand = K_P_roll * (roll_des - roll_deg) - K_D_roll * roll_rate
 
-            pitchCommand = K_P_pitch*err_pitch  -  K_D_pitch*pitch_rate
-
-
-
-            # ROLL PID CONTROLLER
-            K_VY_P = 30         # Proportional: deg of tilt per m/s of error
-            K_VY_D = 7.25        
-            ROLL_LIMIT = 50.0    # deg, max tilt
-            
-            vy_err = v_des_east - vy_world
-            d_vy_err = (vy_err - self.prev_vy_err) / dt
-            
-            self.prev_vy_err = vy_err
-            
-            roll_des_raw = (K_VY_P * vy_err) + (K_VY_D * d_vy_err)
-            roll_des = float(np.clip(roll_des_raw, -ROLL_LIMIT, ROLL_LIMIT))
-            
-            K_P_roll = 0.015    # match pitch
-            K_D_roll = 0.001025    # raised with K_P for damping
-
-            err_roll = roll_des - roll_deg
-
-            rollCommand = K_P_roll*err_roll  -  K_D_roll*roll_rate
-
-
-            # YAW PID
+            # YAW — hold south-facing heading
             K_P_yaw = 0.03
             K_D_yaw = 0.002
-
             err_yaw = 180 - yaw_deg
             err_yaw = (err_yaw + 180.0) % 360.0 - 180.0
+            yawCommand = K_P_yaw * err_yaw - K_D_yaw * yaw_rate
 
-            yawCommand = K_P_yaw*err_yaw  -  K_D_yaw*yaw_rate
-
-
-            # THRUST PID
-            thrust_trim = 0.265  # experimentally determined, this is damn near correct +/- 0.0001
-            
-            K_P_thrust = 0.0925
-            K_D_thrust = 0.05
-
-            err_elev = elev_des - z_pos
-
-            thrustCommand = thrust_trim - err_elev * K_P_thrust  + vz_world * K_D_thrust
-
-            tilt_factor = 1.0 - 2.0 * (qx**2 + qy**2)
-            if tilt_factor < 0.01: 
-                tilt_factor = 0.01
-            thrustCommand = thrustCommand / tilt_factor
-
-            if thrustCommand > 1:
-                print("Over Angled; thrust cannot maintain elevation")
-            
-            thrustCommand = np.clip(thrustCommand, 0, 1)
+            # THRUST
+            thrust_trim = 0.26567
+            K_P_thrust  = 0.015
+            K_D_thrust  = 0.022
+            err_elev = self._elev_des - z_pos
+            thrustCommand = float(np.clip(
+                thrust_trim - err_elev * K_P_thrust + vz_world * K_D_thrust, 0.0, 1.0))
 
 
 
