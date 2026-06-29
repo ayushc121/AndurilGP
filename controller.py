@@ -100,30 +100,21 @@ class Controller:
             MAVLINK_CMD_SIM_RESET, 0, 0, 0, 0, 0, 0, 0, 0
         )
 
-
-    def _send_attitude_rates(self, roll_rad, pitch_rad, yaw_rad, thrust):
-        """
-        Sends raw roll/pitch/yaw RATES and thrust commands.
-        Thrust is a value between 0.0 (motors off) and 1.0 (full throttle).
-        """
-        now_ms = int(time.time() * 1000)
-        
-        # typemask 7 (0b00000111) means "IGNORE body rates, USE attitude and thrust"
-        typemask = 7 
-        
-        # Convert the desired Euler angles to a Quaternion
-        q = euler_to_quat(roll_rad, pitch_rad, yaw_rad)
-        
+    
+    def _send_attitude_target(self, roll_deg, pitch_deg, yaw_deg, thrust):
+        q = euler_to_quat(math.radians(roll_deg),
+                          math.radians(pitch_deg),
+                          math.radians(yaw_deg))
         self.sim_conn.mav.set_attitude_target_send(
-            now_ms - self.system_boot_ms,
+            int(time.time() * 1000) - self.system_boot_ms,
             self.sim_conn.target_system,
             self.sim_conn.target_component,
-            typemask,
+            0b00000111,   # 7 — ignore rates, use quaternion + thrust
             q,
-            0, 0, 0,  # (Ignored by the typemask)
+            0, 0, 0,
             thrust
         )
-
+        
     # ------------------------------------------------------------------
     # Main update — called at CONTROL_HZ from main loop
     # ------------------------------------------------------------------
@@ -402,7 +393,7 @@ class Controller:
             # PID CONTROLLERS
             # ----------------------------------------------------------------
 
-            # PITCH PID CONTROLLER
+            # PITCH DES
             K_VX_P = 1.5           # deg of corrective pitch per m/s of north-speed error
             K_VX_D = 0
             PITCH_LIMIT = 50.0   # deg, max tilt
@@ -416,16 +407,8 @@ class Controller:
 
             pitch_des = float(np.clip(pitch_des_raw, -PITCH_LIMIT, -20))
 
-            K_P_pitch = 0.015
-            K_D_pitch = 0.001
 
-            err_pitch = pitch_des - pitch_deg
-
-            pitchCommand = K_P_pitch*err_pitch  -  K_D_pitch*pitch_rate
-
-
-
-            # ROLL PID CONTROLLER
+            # ROLL DES
             K_VY_P = 30         # Proportional: deg of tilt per m/s of error
             K_VY_D = 7.25        
             ROLL_LIMIT = 50.0    # deg, max tilt
@@ -437,24 +420,10 @@ class Controller:
             
             roll_des_raw = (K_VY_P * vy_err) + (K_VY_D * d_vy_err)
             roll_des = float(np.clip(roll_des_raw, -ROLL_LIMIT, ROLL_LIMIT))
+
+
+            yaw_des = 0
             
-            K_P_roll = 0.015    # match pitch
-            K_D_roll = 0.001025    # raised with K_P for damping
-
-            err_roll = roll_des - roll_deg
-
-            rollCommand = K_P_roll*err_roll  -  K_D_roll*roll_rate
-
-
-            # YAW PID
-            K_P_yaw = 0.03
-            K_D_yaw = 0.002
-
-            err_yaw = 180 - yaw_deg
-            err_yaw = (err_yaw + 180.0) % 360.0 - 180.0
-
-            yawCommand = K_P_yaw*err_yaw  -  K_D_yaw*yaw_rate
-
 
             # THRUST PID
             thrust_trim = 0.265  # experimentally determined, this is damn near correct +/- 0.0001
@@ -477,9 +446,8 @@ class Controller:
             thrustCommand = np.clip(thrustCommand, 0, 1)
 
 
-
-            self._send_attitude_rates(rollCommand, pitchCommand, yawCommand, thrustCommand)
-
+            
+            self._send_attitude_target(roll_des, pitch_des, yaw_des, thrustCommand)
 
             time.sleep(1.0 / CONTROL_HZ)
 
