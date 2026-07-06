@@ -534,16 +534,43 @@ class Controller:
                 v_lat_des = 0.0
 
             # ----------------------------------------------------------------
-            # YAW — steer toward gate center using body-frame bearing.
-            # gate bearing in body = atan2(by, bx); add current AHRS yaw to
-            # get world bearing. Smoothly track with EMA so the drone turns
-            # toward the gate without hard jumps.
+            # YAW — goal 3: approach gate perpendicular to its face.
+            #
+            # Primary: PnP gate face normal → perpendicular approach heading.
+            #   IPPE returns 2 solutions. The correct one has the gate face
+            #   pointing TOWARD the camera, so n_cam[2] < 0 (opposing +Z look
+            #   direction). If n_cam[2] > 0 we got the flipped solution — negate.
+            #   Gate approach direction = -n_cam (from drone toward gate center,
+            #   perpendicular to gate face).
+            #
+            # Fallback: if PnP unavailable, steer toward gate center by bearing.
             # ----------------------------------------------------------------
             if vision_valid:
-                gate_bearing_body_deg = math.degrees(math.atan2(by, bx))
-                gate_world_bearing    = yaw_deg + gate_bearing_body_deg
+                t = math.radians(20.0); ct, st = math.cos(t), math.sin(t)
+                if vision.get('pnp_ok') and vision.get('pnp_rvec') is not None:
+                    rvec  = np.array(vision['pnp_rvec'], dtype=np.float64)
+                    R, _  = cv2.Rodrigues(rvec)
+                    n_cam = R @ np.array([0.0, 0.0, 1.0])
+                    if n_cam[2] > 0:          # wrong IPPE solution — flip
+                        n_cam = -n_cam
+                    # approach direction in body frame (-n_cam, cam→body tilt 20°)
+                    n_bx = ct * (-n_cam[2]) + st * (-n_cam[1])
+                    n_by = -n_cam[0]
+                    yaw_offset_deg = math.degrees(math.atan2(n_by, n_bx))
+                    # EMA with >40° flip guard against noisy PnP frames
+                    if self._gate_normal_ema is None:
+                        self._gate_normal_ema = yaw_offset_deg
+                    elif abs(yaw_offset_deg - self._gate_normal_ema) < 40.0:
+                        self._gate_normal_ema = (0.3 * yaw_offset_deg
+                                                + 0.7 * self._gate_normal_ema)
+                    gate_world_bearing = yaw_deg + self._gate_normal_ema
+                else:
+                    # PnP unavailable — fall back to bearing toward gate center
+                    bearing_body = math.degrees(math.atan2(by, bx))
+                    gate_world_bearing = yaw_deg + bearing_body
+
                 yaw_err = (gate_world_bearing - self._last_yaw_des + 180.0) % 360.0 - 180.0
-                self._last_yaw_des += 0.3 * yaw_err   # EMA — converges in ~3 ticks
+                self._last_yaw_des += 0.3 * yaw_err
 
             # ----------------------------------------------------------------
             # ATTITUDE SETPOINTS — velocity errors → desired tilt angles
