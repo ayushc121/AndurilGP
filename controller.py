@@ -546,12 +546,10 @@ class Controller:
             # Fallback: if PnP unavailable, steer toward gate center by bearing.
             # ----------------------------------------------------------------
             if vision_valid:
-                # Gate-center bearing: points drone at the gate opening.
-                # PnP face-normal (goal 3) is implemented but disabled until the
-                # drone reliably passes gate 1 — PnP yaw was rotating the drone
-                # off-center at close range, causing harder collisions than
-                # the simpler bearing approach. Re-enable after gate 1 is cleared.
+                # Gate-center bearing — cap at ±8° to prevent atan2 blowup as
+                # bx→0 during close approach (at bx=1m, by=0.2 gives 11° without cap).
                 bearing_body = math.degrees(math.atan2(by, bx))
+                bearing_body = max(-8.0, min(8.0, bearing_body))
                 gate_world_bearing = yaw_deg + bearing_body
                 yaw_err = (gate_world_bearing - self._last_yaw_des + 180.0) % 360.0 - 180.0
                 self._last_yaw_des += 0.3 * yaw_err
