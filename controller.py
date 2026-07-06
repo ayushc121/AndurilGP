@@ -601,7 +601,7 @@ class Controller:
                                  * math.cos(math.radians(pitch_des)))
 
             if self._tick % DEBUG_EVERY_N == 0:
-                gate_str = (f'bx={bx:.1f} by={by:.1f} bz={bz:.1f}'
+                gate_str = (f'{bx:.1f}m fwd  {by:+.1f}m right  {bz:+.1f}m down'
                             if vision_valid else 'no-vision')
                 print(
                     f'[NAV] vel_body=({vX:+5.1f}fwd {vY:+5.1f}R {vZ:+5.1f}D)m/s  '
