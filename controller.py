@@ -15,7 +15,7 @@ ESTIMATION_POLL_HZ = 400    # estimation thread poll rate — catches every 120 
 
 ARM_RETRY_S      = 1.0
 POST_DISARM_WAIT = 0.25
-DEBUG_EVERY_N    = 60       # print interval (~1 s at 60 Hz)
+DEBUG_EVERY_N    = 20       # print interval (~3x per s at 60 Hz — reduce once tuned)
 HOVER_THRUST     = 0.2635
 MAVLINK_CMD_SIM_RESET = 31000
 
@@ -174,6 +174,7 @@ class Controller:
         self._last_elev_err     = 0.0   # body_z_m held when vision is dark
         self._last_yaw_des      = 0.0   # absolute yaw setpoint held when PnP unavailable
         self._gate_normal_ema   = None  # smoothed yaw offset from gate face normal (deg)
+        self._flying_started    = False # True after first FLYING tick — seeds yaw_des
 
         self._reset_flight_state()
 
@@ -201,6 +202,7 @@ class Controller:
         self._last_elev_err   = 0.0
         self._last_yaw_des    = 0.0
         self._gate_normal_ema = None
+        self._flying_started  = False
         print('Controller state reset.', flush=True)
 
     # ------------------------------------------------------------------
@@ -449,7 +451,8 @@ class Controller:
 
         # -- WAIT_FOR_START ------------------------------------------------
         if self.phase == Phase.WAIT_FOR_START:
-            self._send_attitude_rate(0.0, 0.0, 0.0, 0)
+            # Hold hover thrust so the drone doesn't free-fall during countdown.
+            self._send_attitude_rate(0.0, LAUNCH_PITCH_DEG, 0.0, HOVER_THRUST)
 
             if race_status is not None:
                 sim_ms   = race_status['sim_boot_time_ms']
@@ -489,6 +492,14 @@ class Controller:
                 acc_norm    = self._last_acc_norm
                 cmd_thrust  = self._last_cmd_thrust
                 max_net     = self._last_max_net
+
+            # Seed yaw_des from actual AHRS yaw on the very first FLYING tick.
+            # Prevents a 0° vs actual-yaw mismatch from causing an instant spin.
+            if not self._flying_started:
+                self._last_yaw_des   = yaw_deg
+                self._flying_started = True
+                print(f'[FLY] start: yaw={yaw_deg:.1f}° pitch={pitch_deg:.1f}° '
+                      f'roll={roll_deg:.1f}° — yaw_des seeded', flush=True)
 
             # ----------------------------------------------------------------
             # GUIDANCE — gate-relative position from vision
