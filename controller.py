@@ -546,29 +546,13 @@ class Controller:
             # Fallback: if PnP unavailable, steer toward gate center by bearing.
             # ----------------------------------------------------------------
             if vision_valid:
-                t = math.radians(20.0); ct, st = math.cos(t), math.sin(t)
-                if vision.get('pnp_ok') and vision.get('pnp_rvec') is not None:
-                    rvec  = np.array(vision['pnp_rvec'], dtype=np.float64)
-                    R, _  = cv2.Rodrigues(rvec)
-                    n_cam = R @ np.array([0.0, 0.0, 1.0])
-                    if n_cam[2] > 0:          # wrong IPPE solution — flip
-                        n_cam = -n_cam
-                    # approach direction in body frame (-n_cam, cam→body tilt 20°)
-                    n_bx = ct * (-n_cam[2]) + st * (-n_cam[1])
-                    n_by = -n_cam[0]
-                    yaw_offset_deg = math.degrees(math.atan2(n_by, n_bx))
-                    # EMA with >40° flip guard against noisy PnP frames
-                    if self._gate_normal_ema is None:
-                        self._gate_normal_ema = yaw_offset_deg
-                    elif abs(yaw_offset_deg - self._gate_normal_ema) < 40.0:
-                        self._gate_normal_ema = (0.3 * yaw_offset_deg
-                                                + 0.7 * self._gate_normal_ema)
-                    gate_world_bearing = yaw_deg + self._gate_normal_ema
-                else:
-                    # PnP unavailable — fall back to bearing toward gate center
-                    bearing_body = math.degrees(math.atan2(by, bx))
-                    gate_world_bearing = yaw_deg + bearing_body
-
+                # Gate-center bearing: points drone at the gate opening.
+                # PnP face-normal (goal 3) is implemented but disabled until the
+                # drone reliably passes gate 1 — PnP yaw was rotating the drone
+                # off-center at close range, causing harder collisions than
+                # the simpler bearing approach. Re-enable after gate 1 is cleared.
+                bearing_body = math.degrees(math.atan2(by, bx))
+                gate_world_bearing = yaw_deg + bearing_body
                 yaw_err = (gate_world_bearing - self._last_yaw_des + 180.0) % 360.0 - 180.0
                 self._last_yaw_des += 0.3 * yaw_err
 
