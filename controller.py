@@ -2,6 +2,7 @@ import time
 import math
 import threading
 import numpy as np
+import cv2
 from enum import Enum, auto
 from pymavlink import mavutil
 
@@ -169,6 +170,11 @@ class Controller:
 
         self._thrust_integral = 0
 
+        # Vision hold state — persists across blackout windows (passthrough cooldown)
+        self._last_elev_err     = 0.0   # body_z_m held when vision is dark
+        self._last_yaw_des      = 0.0   # absolute yaw setpoint held when PnP unavailable
+        self._gate_normal_ema   = None  # smoothed yaw offset from gate face normal (deg)
+
         self._reset_flight_state()
 
     # ------------------------------------------------------------------
@@ -192,6 +198,9 @@ class Controller:
             self._last_acc_norm   = 0.0
             self._last_cmd_thrust = 0.0
             self._last_max_net    = 0.0
+        self._last_elev_err   = 0.0
+        self._last_yaw_des    = 0.0
+        self._gate_normal_ema = None
         print('Controller state reset.', flush=True)
 
     # ------------------------------------------------------------------
@@ -481,68 +490,124 @@ class Controller:
                 cmd_thrust  = self._last_cmd_thrust
                 max_net     = self._last_max_net
 
-            # CONTROL CODE HERE — use roll_deg, pitch_deg, yaw_deg,
-            # vel_ned, vel_body, pos_ned, rates_body from snapshot above.
+            # ----------------------------------------------------------------
+            # GUIDANCE — gate-relative position from vision
+            # ----------------------------------------------------------------
+            # Guidance gains
+            K_FWD_POS  = 0.25    # desired fwd speed (m/s) per metre of gate distance
+            V_FWD_MAX  = 6.0     # m/s forward speed cap
+            K_LAT_POS  = 1.2    # desired lateral speed (m/s) per metre of lateral offset
+            V_LAT_MAX  = 3.0    # m/s lateral speed cap
 
-            # SET DESIRED ATTITUDE AND ELEVATION (SHOULD BE INSPIRED BY GATE VISION)
-            pitch_des = -5
-            roll_des = 2
-            yaw_des = -5
-            elev_des = -0    # NEGATIVE IS UP
+            vision = self.data.get('vision_gate_estimate')
+            vision_valid = False
+            if vision is not None:
+                bx = vision.get('body_x_m', float('nan'))
+                by = vision.get('body_y_m', float('nan'))
+                bz = vision.get('body_z_m', float('nan'))
+                if not any(math.isnan(v) for v in (bx, by, bz)) and bx > 0.1:
+                    vision_valid = True
 
-            # PITCH CONTROLLER
-            K_P_pitch = 1
-            pitchCommand = K_P_pitch * (pitch_des-pitch_deg)
+            if vision_valid:
+                # Forward distance → desired forward speed (auto-slows on close approach)
+                v_fwd_des = float(np.clip(K_FWD_POS * bx, 0.0, V_FWD_MAX))
+                # Lateral offset → desired lateral speed (positive by = gate right → fly right)
+                v_lat_des = float(np.clip(K_LAT_POS * by, -V_LAT_MAX, V_LAT_MAX))
+                # Vertical: bz > 0 = gate is below drone (NED); hold for blackout
+                self._last_elev_err = bz
+            else:
+                # Vision dark (passthrough cooldown or no gate) — hold last setpoints
+                v_fwd_des = 0.0
+                v_lat_des = 0.0
 
-            # ROLL CONTROLLER
-            K_P_roll = -1       # KEEP THE COEFFICIENT NEGATIVE
-            rollCommand = K_P_roll * (roll_des-roll_deg)
+            # ----------------------------------------------------------------
+            # TASK 3 — Gate face normal → yaw setpoint
+            # pnp_rvec rotates gate-object-frame to camera frame.
+            # Gate object face normal = [0,0,1] in object frame.
+            # We project it through camera→body to get approach heading offset.
+            # ----------------------------------------------------------------
+            if (vision_valid and vision.get('pnp_ok')
+                    and vision.get('pnp_rvec') is not None):
+                rvec = np.array(vision['pnp_rvec'], dtype=np.float64)
+                R, _ = cv2.Rodrigues(rvec)
+                # Gate face normal in OpenCV camera frame (x=right, y=down, z=forward)
+                n_cam = R @ np.array([0.0, 0.0, 1.0])
+                # Camera → body (20° upward tilt around lateral axis)
+                t = math.radians(20.0)
+                ct, st = math.cos(t), math.sin(t)
+                n_bx =  ct * n_cam[2] + st * n_cam[1]   # body forward
+                n_by =  n_cam[0]                          # body right
+                yaw_offset_deg = math.degrees(math.atan2(n_by, n_bx))
+                # Smooth and guard against IPPE ambiguity flips (>30° jump → hold)
+                if self._gate_normal_ema is None:
+                    self._gate_normal_ema = yaw_offset_deg
+                elif abs(yaw_offset_deg - self._gate_normal_ema) < 30.0:
+                    self._gate_normal_ema = (0.3 * yaw_offset_deg
+                                            + 0.7 * self._gate_normal_ema)
+                self._last_yaw_des = yaw_deg + self._gate_normal_ema
 
-            # YAW CONTROLLER
-            K_P_yaw = -1        # KEEP THE COEFFICIENT NEGATIVE
-            err_yaw = yaw_des-yaw_deg
-            err_yaw = (err_yaw + 180.0) % 360.0 - 180.0      # angle wrapping to prevent flips
-            yawCommand = K_P_yaw * (err_yaw)
+            # ----------------------------------------------------------------
+            # ATTITUDE SETPOINTS — velocity errors → desired tilt angles
+            # ----------------------------------------------------------------
+            K_VX_P    = 3.5     # deg pitch per m/s forward-speed error
+            K_VY_P    = 6.0     # deg roll  per m/s lateral-speed error
+            PITCH_MAX = 25.0    # deg
+            ROLL_MAX  = 25.0    # deg
 
+            # Forward: vX (body frame) vs desired; nose-down (negative pitch) to accelerate
+            vx_err  = v_fwd_des - vX
+            pitch_des = float(np.clip(-K_VX_P * vx_err, -PITCH_MAX, PITCH_MAX))
 
+            # Lateral: vY (body frame, right positive) vs desired
+            vy_err  = v_lat_des - vY
+            roll_des = float(np.clip(K_VY_P * vy_err, -ROLL_MAX, ROLL_MAX))
 
-            # THRUST CONTROLLER - currently unusable due to errors estimating vertical position / velocity with accelerometer data
-            # RELATIVE VERTICAL POSITION/VELOCITY MUST BE CLEANLY IDENTIFIED THROUGH COMPUTER VISION FOR THRUST CALCULATIONS 
-            K_P_thrust = 0
-            K_I_thrust = 0
-            K_D_thrust = 0
+            yaw_des = self._last_yaw_des   # held across blackout; reset on arm
 
-            err_elev = elev_des - pD
-            self._thrust_integral += err_elev * (1.0 / CONTROL_HZ)
-            self._thrust_integral = np.clip(self._thrust_integral, -5.0, 5.0)
+            # ----------------------------------------------------------------
+            # ATTITUDE CONTROLLERS
+            # ----------------------------------------------------------------
+            K_P_pitch = 1.0
+            pitchCommand = K_P_pitch * (pitch_des - pitch_deg)
 
-            thrustCommand = (
-                HOVER_THRUST
-                - err_elev * K_P_thrust
-                - self._thrust_integral * K_I_thrust
-                + vD * K_D_thrust
-            )
+            K_P_roll = 1.0
+            rollCommand = K_P_roll * (roll_des - roll_deg)
 
-            tiltFactor = math.cos(math.radians(roll_deg)) * math.cos(math.radians(pitch_deg))
-            if tiltFactor < 0.01: 
-                tiltFactor = 0.01
+            K_P_yaw = -1.0
+            err_yaw = (yaw_des - yaw_deg + 180.0) % 360.0 - 180.0
+            yawCommand = K_P_yaw * err_yaw
+
+            # ----------------------------------------------------------------
+            # THRUST — driven by vision body_z_m; held during blackout
+            # bz > 0  → gate is below drone → descend → less thrust
+            # vD > 0  → moving down → brake → more thrust
+            # ----------------------------------------------------------------
+            K_P_thrust = 0.08
+            K_D_thrust = 0.04
+
+            thrustCommand = (HOVER_THRUST
+                             - self._last_elev_err * K_P_thrust
+                             + vD * K_D_thrust)
+
+            tiltFactor = max(0.01, math.cos(math.radians(roll_deg))
+                                 * math.cos(math.radians(pitch_deg)))
             thrustCommand = thrustCommand / tiltFactor
 
-
             if self._tick % DEBUG_EVERY_N == 0:
+                gate_str = (f'bx={bx:.1f} by={by:.1f} bz={bz:.1f}'
+                            if vision_valid else 'no-vision')
                 print(
-                    f'[NAV] pos=({pN:+7.1f}N {pE:+7.1f}E {pD:+6.1f}D)m  '
-                    f'vel_ned=({vN:+6.1f}N {vE:+6.1f}E {vD:+5.1f}D)m/s  '
-                    f'vel_body=({vX:+6.1f}fwd {vY:+5.1f}right {vZ:+5.1f}down)m/s  '
+                    f'[NAV] vel_body=({vX:+5.1f}fwd {vY:+5.1f}R {vZ:+5.1f}D)m/s  '
                     f'att=({roll_deg:+5.1f}r {pitch_deg:+5.1f}p {yaw_deg:+5.1f}y)°  '
-                    f'rates=({rr:+6.1f}r {pr:+6.1f}p {yr:+6.1f}y)°/s  '
-                    f'|acc|={acc_norm:6.2f}  thrust={cmd_thrust:.3f}  cap={max_net:6.2f}m/s²  '
-                    f'cmd=(roll={rollCommand:+6.2f} pitch={pitchCommand:+6.2f} '
-                    f'yaw={yawCommand:+6.2f} thrust={thrustCommand:.3f})',
+                    f'gate={gate_str}  '
+                    f'des=(p={pitch_des:+5.1f} r={roll_des:+5.1f} '
+                    f'y={yaw_des:+6.1f})°  '
+                    f'cmd=(p={pitchCommand:+5.2f} r={rollCommand:+5.2f} '
+                    f'y={yawCommand:+5.2f} T={thrustCommand:.3f})',
                     flush=True
                 )
-                if thrustCommand > 1:
-                    print("Over Angled; thrust cannot maintain elevation")
+                if thrustCommand > 1.0:
+                    print('[WARN] thrust clipped — over-angled', flush=True)
 
             thrustCommand = np.clip(thrustCommand, 0, 1)
             self._send_attitude_rate(rollCommand, pitchCommand, yawCommand, thrustCommand)
