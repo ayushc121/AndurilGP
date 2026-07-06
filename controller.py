@@ -527,8 +527,10 @@ class Controller:
                 # Vertical: bz > 0 = gate is below drone (NED); hold for blackout
                 self._last_elev_err = bz
             else:
-                # Vision dark (passthrough cooldown or no gate) — hold last setpoints
-                v_fwd_des = 0.0
+                # Vision dark (passthrough cooldown or no gate).
+                # Maintain gentle forward speed so the drone keeps flying through
+                # the gate and toward the next one instead of braking hard.
+                v_fwd_des = 3.0
                 v_lat_des = 0.0
 
             # ----------------------------------------------------------------
@@ -577,7 +579,7 @@ class Controller:
             # vD > 0  → falling → brake → more thrust.
             # Tilt compensation uses COMMANDED angles (reliable), not AHRS.
             # ----------------------------------------------------------------
-            K_P_thrust = 0.08
+            K_P_thrust = 0.06   # was 0.08; reduced to cut altitude overshoot past gate top
             K_D_thrust = 0.04
 
             thrustCommand = (HOVER_THRUST
