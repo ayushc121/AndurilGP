@@ -451,8 +451,8 @@ class Controller:
 
         # -- WAIT_FOR_START ------------------------------------------------
         if self.phase == Phase.WAIT_FOR_START:
-            # Hold hover thrust so the drone doesn't free-fall during countdown.
-            self._send_attitude_rate(0.0, LAUNCH_PITCH_DEG, 0.0, HOVER_THRUST)
+            # Drone sits on the launch pad held by the sim — send zero thrust.
+            self._send_attitude_rate(0.0, 0.0, 0.0, 0.0)
 
             if race_status is not None:
                 sim_ms   = race_status['sim_boot_time_ms']
@@ -576,22 +576,20 @@ class Controller:
             yaw_des = self._last_yaw_des   # held across blackout; reset on arm
 
             # ----------------------------------------------------------------
-            # ATTITUDE CONTROLLERS
+            # ATTITUDE COMMANDS — sent directly as quaternion setpoints.
+            # typemask=7 means the autopilot's own IMU loop holds these angles;
+            # we must NOT add an outer feedback loop using AHRS pitch_deg/roll_deg
+            # because AHRS drifts under vibration and makes commands insane.
             # ----------------------------------------------------------------
-            K_P_pitch = 1.0
-            pitchCommand = K_P_pitch * (pitch_des - pitch_deg)
-
-            K_P_roll = 1.0
-            rollCommand = K_P_roll * (roll_des - roll_deg)
-
-            K_P_yaw = -1.0
-            err_yaw = (yaw_des - yaw_deg + 180.0) % 360.0 - 180.0
-            yawCommand = K_P_yaw * err_yaw
+            pitchCommand = pitch_des   # deg, autopilot drives to this
+            rollCommand  = roll_des    # deg, autopilot drives to this
+            yawCommand   = yaw_des     # deg, absolute world-frame yaw
 
             # ----------------------------------------------------------------
-            # THRUST — driven by vision body_z_m; held during blackout
-            # bz > 0  → gate is below drone → descend → less thrust
-            # vD > 0  → moving down → brake → more thrust
+            # THRUST — driven by vision body_z_m; held during blackout.
+            # bz > 0  → gate below drone → descend → less thrust.
+            # vD > 0  → falling → brake → more thrust.
+            # Tilt compensation uses COMMANDED angles (reliable), not AHRS.
             # ----------------------------------------------------------------
             K_P_thrust = 0.08
             K_D_thrust = 0.04
@@ -600,9 +598,8 @@ class Controller:
                              - self._last_elev_err * K_P_thrust
                              + vD * K_D_thrust)
 
-            tiltFactor = max(0.01, math.cos(math.radians(roll_deg))
-                                 * math.cos(math.radians(pitch_deg)))
-            thrustCommand = thrustCommand / tiltFactor
+            tiltFactor = max(0.01, math.cos(math.radians(roll_des))
+                                 * math.cos(math.radians(pitch_des)))
 
             if self._tick % DEBUG_EVERY_N == 0:
                 gate_str = (f'bx={bx:.1f} by={by:.1f} bz={bz:.1f}'
