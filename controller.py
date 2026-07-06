@@ -534,20 +534,25 @@ class Controller:
                 v_lat_des = 0.0
 
             # ----------------------------------------------------------------
-            # YAW — goal 3: approach gate perpendicular to its face.
-            #
-            # Primary: PnP gate face normal → perpendicular approach heading.
-            #   IPPE returns 2 solutions. The correct one has the gate face
-            #   pointing TOWARD the camera, so n_cam[2] < 0 (opposing +Z look
-            #   direction). If n_cam[2] > 0 we got the flipped solution — negate.
-            #   Gate approach direction = -n_cam (from drone toward gate center,
-            #   perpendicular to gate face).
-            #
-            # Fallback: if PnP unavailable, steer toward gate center by bearing.
+            # YAW — steer toward gate center; log tilt for situational awareness.
             # ----------------------------------------------------------------
+            gate_tilt_deg = float('nan')
             if vision_valid:
-                # Gate-center bearing — cap at ±8° to prevent atan2 blowup as
-                # bx→0 during close approach (at bx=1m, by=0.2 gives 11° without cap).
+                # Goal 3: detect gate tilt from PnP face normal (logged, not used
+                # for navigation — approaching perpendicular to gate face is slower).
+                if vision.get('pnp_ok') and vision.get('pnp_rvec') is not None:
+                    rvec  = np.array(vision['pnp_rvec'], dtype=np.float64)
+                    R, _  = cv2.Rodrigues(rvec)
+                    n_cam = R @ np.array([0.0, 0.0, 1.0])
+                    if n_cam[2] > 0:       # fix IPPE ambiguity
+                        n_cam = -n_cam
+                    t = math.radians(20.0); ct, st = math.cos(t), math.sin(t)
+                    n_bx = ct * (-n_cam[2]) + st * (-n_cam[1])
+                    n_by = -n_cam[0]
+                    gate_tilt_deg = math.degrees(math.atan2(n_by, n_bx))
+
+                # Navigation: steer at gate center, cap at ±8° to prevent
+                # atan2 blowup as bx→0 during close approach.
                 bearing_body = math.degrees(math.atan2(by, bx))
                 bearing_body = max(-8.0, min(8.0, bearing_body))
                 gate_world_bearing = yaw_deg + bearing_body
@@ -599,7 +604,8 @@ class Controller:
                                  * math.cos(math.radians(pitch_des)))
 
             if self._tick % DEBUG_EVERY_N == 0:
-                gate_str = (f'{bx:.1f}m fwd  {by:+.1f}m right  {bz:+.1f}m down'
+                tilt_str = f'  tilt={gate_tilt_deg:+.0f}°' if not math.isnan(gate_tilt_deg) else ''
+                gate_str = (f'{bx:.1f}m fwd  {by:+.1f}m right  {bz:+.1f}m down{tilt_str}'
                             if vision_valid else 'no-vision')
                 print(
                     f'[NAV] vel_body=({vX:+5.1f}fwd {vY:+5.1f}R {vZ:+5.1f}D)m/s  '
