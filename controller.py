@@ -532,30 +532,16 @@ class Controller:
                 v_lat_des = 0.0
 
             # ----------------------------------------------------------------
-            # TASK 3 — Gate face normal → yaw setpoint
-            # pnp_rvec rotates gate-object-frame to camera frame.
-            # Gate object face normal = [0,0,1] in object frame.
-            # We project it through camera→body to get approach heading offset.
+            # YAW — steer toward gate center using body-frame bearing.
+            # gate bearing in body = atan2(by, bx); add current AHRS yaw to
+            # get world bearing. Smoothly track with EMA so the drone turns
+            # toward the gate without hard jumps.
             # ----------------------------------------------------------------
-            if (vision_valid and vision.get('pnp_ok')
-                    and vision.get('pnp_rvec') is not None):
-                rvec = np.array(vision['pnp_rvec'], dtype=np.float64)
-                R, _ = cv2.Rodrigues(rvec)
-                # Gate face normal in OpenCV camera frame (x=right, y=down, z=forward)
-                n_cam = R @ np.array([0.0, 0.0, 1.0])
-                # Camera → body (20° upward tilt around lateral axis)
-                t = math.radians(20.0)
-                ct, st = math.cos(t), math.sin(t)
-                n_bx =  ct * n_cam[2] + st * n_cam[1]   # body forward
-                n_by =  n_cam[0]                          # body right
-                yaw_offset_deg = math.degrees(math.atan2(n_by, n_bx))
-                # Smooth and guard against IPPE ambiguity flips (>30° jump → hold)
-                if self._gate_normal_ema is None:
-                    self._gate_normal_ema = yaw_offset_deg
-                elif abs(yaw_offset_deg - self._gate_normal_ema) < 30.0:
-                    self._gate_normal_ema = (0.3 * yaw_offset_deg
-                                            + 0.7 * self._gate_normal_ema)
-                self._last_yaw_des = yaw_deg + self._gate_normal_ema
+            if vision_valid:
+                gate_bearing_body_deg = math.degrees(math.atan2(by, bx))
+                gate_world_bearing    = yaw_deg + gate_bearing_body_deg
+                yaw_err = (gate_world_bearing - self._last_yaw_des + 180.0) % 360.0 - 180.0
+                self._last_yaw_des += 0.3 * yaw_err   # EMA — converges in ~3 ticks
 
             # ----------------------------------------------------------------
             # ATTITUDE SETPOINTS — velocity errors → desired tilt angles
