@@ -561,16 +561,17 @@ class Controller:
                 self._last_yaw_des += 0.3 * yaw_err
 
             # ----------------------------------------------------------------
-            # VELOCITY FUSION — blend IMU strapdown with optical flow (30 Hz).
-            # Only lateral (vY) and vertical (vZ) are blended; forward (vX) stays
-            # IMU-only because divergence-based flow is noisy without rotation
-            # compensation. Gate must have ≥8 tracked features to use flow.
+            # VELOCITY FUSION — blend IMU strapdown with gate-position derivative.
+            # Gate is stationary → d(bx,by,bz)/dt gives all three body-frame
+            # velocities directly, no depth ambiguity. Published by vision_rx at
+            # 30 Hz; set to None during passthrough suppression so IMU takes over.
             # ----------------------------------------------------------------
-            OF_ALPHA   = 0.7   # IMU weight; 0.3 goes to optical flow
+            GATE_ALPHA = 0.5   # equal weight IMU / gate-derivative; tune if needed
             vel_source = 'imu'
-            if vision_vel is not None and vision_vel.get('n_tracks', 0) >= 8:
-                vY = OF_ALPHA * vY + (1.0 - OF_ALPHA) * vision_vel['vy_body_mps']
-                vZ = OF_ALPHA * vZ + (1.0 - OF_ALPHA) * vision_vel['vz_body_mps']
+            if vision_vel is not None:
+                vX = GATE_ALPHA * vX + (1.0 - GATE_ALPHA) * vision_vel['vx_body_mps']
+                vY = GATE_ALPHA * vY + (1.0 - GATE_ALPHA) * vision_vel['vy_body_mps']
+                vZ = GATE_ALPHA * vZ + (1.0 - GATE_ALPHA) * vision_vel['vz_body_mps']
                 vel_source = 'fused'
 
             # ----------------------------------------------------------------
