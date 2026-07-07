@@ -583,33 +583,60 @@ class VisionRX:
     # Gate detection
     # ------------------------------------------------------------------
 
+    # Physical velocity cap — readings above this indicate a bad PnP frame.
+    _MAX_GATE_VEL_MPS = 25.0
+
     def _gate_velocity(self, estimate):
         """
         Estimate body-frame velocity from the rate of change of the gate's
         body-frame position. The gate is stationary, so:
             vX = -d(bx)/dt,  vY = -d(by)/dt,  vZ = -d(bz)/dt
-        bx/by/bz are already in body frame (camera tilt handled by body_relative_pose).
-        Publishes to data['vision_velocity']; sets it to None when estimate is invalid.
+
+        Uses the raw (pre-EMA) PnP tvec when available so the EMA lag on
+        the navigation estimate doesn't attenuate the velocity signal.
+        Falls back to the smoothed body pose when PnP is unavailable.
+        Readings exceeding _MAX_GATE_VEL_MPS are rejected as PnP jumps.
+        Publishes to data['vision_velocity']; sets it to None when invalid.
         """
         if estimate is None:
             self._prev_bxyz = None
             self.data['vision_velocity'] = None
             return
-        bx = estimate.get('body_x_m', float('nan'))
-        by = estimate.get('body_y_m', float('nan'))
-        bz = estimate.get('body_z_m', float('nan'))
+
+        # Raw tvec → body pose (bypasses EMA lag on the smoothed estimate).
+        if estimate.get('pnp_ok') and estimate.get('pnp_tvec_raw') is not None:
+            tmp = {**estimate, 'pnp_tvec': estimate['pnp_tvec_raw']}
+            body_relative_pose(tmp)
+            bx = tmp.get('body_x_m', float('nan'))
+            by = tmp.get('body_y_m', float('nan'))
+            bz = tmp.get('body_z_m', float('nan'))
+        else:
+            bx = estimate.get('body_x_m', float('nan'))
+            by = estimate.get('body_y_m', float('nan'))
+            bz = estimate.get('body_z_m', float('nan'))
+
         if any(math.isnan(v) for v in (bx, by, bz)) or bx <= 0.1:
             self._prev_bxyz = None
             self.data['vision_velocity'] = None
             return
+
         if self._prev_bxyz is not None:
-            dt = 1.0 / _GATE_VEL_FPS
+            dt  = 1.0 / _GATE_VEL_FPS
             pbx, pby, pbz = self._prev_bxyz
+            vx = -(bx - pbx) / dt
+            vy = -(by - pby) / dt
+            vz = -(bz - pbz) / dt
+            # Reject frames where PnP jumped — physically impossible readings.
+            if max(abs(vx), abs(vy), abs(vz)) > self._MAX_GATE_VEL_MPS:
+                self._prev_bxyz = None
+                self.data['vision_velocity'] = None
+                return
             self.data['vision_velocity'] = {
-                'vx_body_mps': round(-(bx - pbx) / dt, 2),
-                'vy_body_mps': round(-(by - pby) / dt, 2),
-                'vz_body_mps': round(-(bz - pbz) / dt, 2),
+                'vx_body_mps': round(vx, 2),
+                'vy_body_mps': round(vy, 2),
+                'vz_body_mps': round(vz, 2),
             }
+
         self._prev_bxyz = (bx, by, bz)
 
     def process_frame(self, frame_id, img):
@@ -685,6 +712,7 @@ class VisionRX:
         if estimate is not None and estimate.get('pnp_ok'):
             cur_gate = estimate.get('target_gate')
             new_tvec = estimate['pnp_tvec'].copy()
+            estimate['pnp_tvec_raw'] = new_tvec   # preserved for velocity derivative
             if (self._pnp_ema is not None
                     and self._pnp_ema[1] == cur_gate):
                 prev_tvec = self._pnp_ema[0]
