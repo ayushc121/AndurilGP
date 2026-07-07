@@ -499,6 +499,7 @@ class VisionRX:
         self._ema_prev   = None     # previous smoothed bbox (EMA state)
         self._pnp_ema    = None     # (tvec, gate_id) — PnP tvec EMA state
         self._prev_bxyz = None   # (bx, by, bz) from previous frame for velocity derivative
+        self._vel_seq   = 0      # increments each time a new velocity is published
         # Gate-passthrough suppression state
         self._in_gate         = False  # True while gate area > threshold (inside gate)
         self._pass_cooldown   = 0      # frames left to suppress after passing through
@@ -619,10 +620,12 @@ class VisionRX:
         if self._prev_bxyz is not None:
             dt = 1.0 / _GATE_VEL_FPS
             pbx, pby, pbz = self._prev_bxyz
+            self._vel_seq += 1
             self.data['vision_velocity'] = {
                 'vx_body_mps': round(-(bx - pbx) / dt, 2),
                 'vy_body_mps': round(-(by - pby) / dt, 2),
                 'vz_body_mps': round(-(bz - pbz) / dt, 2),
+                'seq':         self._vel_seq,
             }
 
         self._prev_bxyz = (bx, by, bz)
