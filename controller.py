@@ -181,6 +181,7 @@ class Controller:
         self._last_yaw_des      = 0.0   # absolute yaw setpoint held when PnP unavailable
         self._gate_normal_ema   = None  # smoothed yaw offset from gate face normal (deg)
         self._flying_started    = False # True after first FLYING tick — seeds yaw_des
+        self._last_vel_seq      = -1    # last camera velocity seq seen; -1 = none yet
 
         self._reset_flight_state()
 
@@ -209,6 +210,7 @@ class Controller:
         self._last_yaw_des    = 0.0
         self._gate_normal_ema = None
         self._flying_started  = False
+        self._last_vel_seq    = -1
         print('Controller state reset.', flush=True)
 
     # ------------------------------------------------------------------
@@ -573,11 +575,14 @@ class Controller:
             # 30 Hz; set to None during passthrough suppression so IMU takes over.
             # ----------------------------------------------------------------
             vel_source = 'imu'
-            if vision_vel is not None:
+            if vision_vel is not None and vision_vel.get('seq', -1) != self._last_vel_seq:
+                # Fresh camera frame — use camera velocity (+ optional IMU blend).
+                self._last_vel_seq = vision_vel['seq']
                 vX = VEL_IMU_WEIGHT * vX + (1.0 - VEL_IMU_WEIGHT) * vision_vel['vx_body_mps']
                 vY = VEL_IMU_WEIGHT * vY + (1.0 - VEL_IMU_WEIGHT) * vision_vel['vy_body_mps']
                 vZ = VEL_IMU_WEIGHT * vZ + (1.0 - VEL_IMU_WEIGHT) * vision_vel['vz_body_mps']
                 vel_source = 'cam' if VEL_IMU_WEIGHT == 0.0 else 'fused'
+            # Stale camera frame (seq unchanged) or no vision → IMU only.
 
             # ----------------------------------------------------------------
             # ATTITUDE SETPOINTS — velocity errors → desired tilt angles
