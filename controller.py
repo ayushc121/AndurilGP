@@ -510,7 +510,8 @@ class Controller:
             K_LAT_POS  = 1.2    # desired lateral speed (m/s) per metre of lateral offset
             V_LAT_MAX  = 3.0    # m/s lateral speed cap
 
-            vision = self.data.get('vision_gate_estimate')
+            vision     = self.data.get('vision_gate_estimate')
+            vision_vel = self.data.get('vision_velocity')
             vision_valid = False
             if vision is not None:
                 bx = vision.get('body_x_m', float('nan'))
@@ -558,6 +559,19 @@ class Controller:
                 gate_world_bearing = yaw_deg + bearing_body
                 yaw_err = (gate_world_bearing - self._last_yaw_des + 180.0) % 360.0 - 180.0
                 self._last_yaw_des += 0.3 * yaw_err
+
+            # ----------------------------------------------------------------
+            # VELOCITY FUSION — blend IMU strapdown with optical flow (30 Hz).
+            # Only lateral (vY) and vertical (vZ) are blended; forward (vX) stays
+            # IMU-only because divergence-based flow is noisy without rotation
+            # compensation. Gate must have ≥8 tracked features to use flow.
+            # ----------------------------------------------------------------
+            OF_ALPHA   = 0.7   # IMU weight; 0.3 goes to optical flow
+            vel_source = 'imu'
+            if vision_vel is not None and vision_vel.get('n_tracks', 0) >= 8:
+                vY = OF_ALPHA * vY + (1.0 - OF_ALPHA) * vision_vel['vy_body_mps']
+                vZ = OF_ALPHA * vZ + (1.0 - OF_ALPHA) * vision_vel['vz_body_mps']
+                vel_source = 'fused'
 
             # ----------------------------------------------------------------
             # ATTITUDE SETPOINTS — velocity errors → desired tilt angles
@@ -608,7 +622,7 @@ class Controller:
                 gate_str = (f'{bx:.1f}m fwd  {by:+.1f}m right  {bz:+.1f}m down{tilt_str}'
                             if vision_valid else 'no-vision')
                 print(
-                    f'[NAV] vel_body=({vX:+5.1f}fwd {vY:+5.1f}R {vZ:+5.1f}D)m/s  '
+                    f'[NAV] vel_{vel_source}=({vX:+5.1f}fwd {vY:+5.1f}R {vZ:+5.1f}D)m/s  '
                     f'att=({roll_deg:+5.1f}r {pitch_deg:+5.1f}p {yaw_deg:+5.1f}y)°  '
                     f'gate={gate_str}  '
                     f'des=(p={pitch_des:+5.1f} r={roll_des:+5.1f} '
