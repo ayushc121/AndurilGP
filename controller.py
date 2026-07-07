@@ -16,39 +16,14 @@ ESTIMATION_POLL_HZ = 400    # estimation thread poll rate — catches every 120 
 ARM_RETRY_S      = 1.0
 POST_DISARM_WAIT = 0.25
 DEBUG_EVERY_N    = 20       # print interval (~3x per s at 60 Hz — reduce once tuned)
-HOVER_THRUST     = 0.2635
+HOVER_THRUST     = 0.264
 MAVLINK_CMD_SIM_RESET = 31000
-
-# Velocity fusion: weight given to IMU strapdown when gate-position derivative
-# is available. 0.0 = camera-only (no IMU blending); 1.0 = IMU-only (no vision).
-# Camera derivative doesn't drift (measures against stationary gate); IMU does.
-# Increase toward 0.5 if gate derivative is noisy (visible in vel_fused= log).
-VEL_IMU_WEIGHT = 0.0
 
 # Known launch attitude — drone always starts on an angled block.
 LAUNCH_PITCH_DEG = -17.8    # NED: negative = nose down
 
 G = 9.81   # m/s²
 
-# Physical cap on net linear acceleration, derived from the COMMANDED
-# thrust rather than the measured accelerometer magnitude.
-#
-# Thrust-to-acceleration model (identified from earlier parameter work):
-#       max_accel = THRUST_ACCEL_COEFF * cmd_thrust²
-#
-# This is the total specific-force magnitude the motors are *commanded* to
-# produce.  As with the gravity-removal geometry, the component fighting
-# gravity is G, so the maximum possible net linear acceleration is:
-#
-#       max_net_accel = sqrt(max_accel² − G²)     (max_accel ≥ G)
-#                     = 0                            (max_accel < G)
-#
-# Using the commanded value instead of the measured accelerometer magnitude
-# means the cap reflects what the motors are being asked to do, independent
-# of accelerometer noise or any residual attitude-estimation error in the
-# measured specific force.  cmd_thrust is captured from the last attitude
-# target sent to the simulator (control loop, 60 Hz) and read by the
-# estimation thread (400 Hz) under _state_lock.
 THRUST_ACCEL_COEFF = 9.81 / HOVER_THRUST**2   # m/s² per thrust^2
 
 
@@ -177,11 +152,14 @@ class Controller:
         self._thrust_integral = 0
 
         # Vision hold state — persists across blackout windows (passthrough cooldown)
-        self._last_elev_err     = 0.0   # body_z_m held when vision is dark
-        self._last_yaw_des      = 0.0   # absolute yaw setpoint held when PnP unavailable
-        self._gate_normal_ema   = None  # smoothed yaw offset from gate face normal (deg)
-        self._flying_started    = False # True after first FLYING tick — seeds yaw_des
-        self._last_vel_seq      = -1    # last camera velocity seq seen; -1 = none yet
+        self._last_elev_err       = 0.0   # world-frame gate elevation error (m), frozen on loss
+        self._last_fused_frame_id = None  # frame_id of last velocity fusion update
+        self._gate_tilt_ema       = None  # EMA-smoothed gate face normal angle (deg)
+        # Vision-derived rate state — previous frame values for finite-difference D terms.
+        # These replace IMU vY/vD in roll and thrust D terms, avoiding IMU drift errors.
+        self._last_d_frame_id = None  # frame_id when D terms were last updated from vision
+        self._vY_at_vision    = 0.0   # body lateral velocity snapshotted at last vision D update
+        self._vD_at_vision    = 0.0   # NED down velocity snapshotted at last vision D update
 
         self._reset_flight_state()
 
@@ -206,11 +184,16 @@ class Controller:
             self._last_acc_norm   = 0.0
             self._last_cmd_thrust = 0.0
             self._last_max_net    = 0.0
-        self._last_elev_err   = 0.0
-        self._last_yaw_des    = 0.0
-        self._gate_normal_ema = None
-        self._flying_started  = False
-        self._last_vel_seq    = -1
+        self._last_elev_err       = 0.0
+        self._last_fused_frame_id = None
+        self._gate_tilt_ema       = None
+        self._prev_bearing_body     = None
+        self._prev_bearing_frame_id = None
+        self._prev_gate_pD          = None
+        self._prev_elev_frame_id    = None
+        self._last_d_frame_id = None
+        self._vY_at_vision    = 0.0
+        self._vD_at_vision    = 0.0
         print('Controller state reset.', flush=True)
 
     # ------------------------------------------------------------------
@@ -500,27 +483,17 @@ class Controller:
                 acc_norm    = self._last_acc_norm
                 cmd_thrust  = self._last_cmd_thrust
                 max_net     = self._last_max_net
-
-            # Seed yaw_des from actual AHRS yaw on the very first FLYING tick.
-            # Prevents a 0° vs actual-yaw mismatch from causing an instant spin.
-            if not self._flying_started:
-                self._last_yaw_des   = yaw_deg
-                self._flying_started = True
-                print(f'[FLY] start: yaw={yaw_deg:.1f}° pitch={pitch_deg:.1f}° '
-                      f'roll={roll_deg:.1f}° — yaw_des seeded', flush=True)
+                quat        = self.ahrs.quaternion   # body→NED rotation for elevation error
 
             # ----------------------------------------------------------------
             # GUIDANCE — gate-relative position from vision
             # ----------------------------------------------------------------
-            # Guidance gains
-            K_FWD_POS  = 0.25    # desired fwd speed (m/s) per metre of gate distance
-            V_FWD_MAX  = 6.0     # m/s forward speed cap
-            K_LAT_POS  = 1.2    # desired lateral speed (m/s) per metre of lateral offset
-            V_LAT_MAX  = 3.0    # m/s lateral speed cap
-
             vision     = self.data.get('vision_gate_estimate')
             vision_vel = self.data.get('vision_velocity')
             vision_valid = False
+            bx = by = bz = float('nan')
+            # frame_id needed throughout this block for gating derivative terms
+            vis_frame_id = vision.get('frame_id') if vision is not None else None
             if vision is not None:
                 bx = vision.get('body_x_m', float('nan'))
                 by = vision.get('body_y_m', float('nan'))
@@ -528,124 +501,257 @@ class Controller:
                 if not any(math.isnan(v) for v in (bx, by, bz)) and bx > 0.1:
                     vision_valid = True
 
-            if vision_valid:
-                # Forward distance → desired forward speed (auto-slows on close approach)
-                v_fwd_des = float(np.clip(K_FWD_POS * bx, 0.0, V_FWD_MAX))
-                # Lateral offset → desired lateral speed (positive by = gate right → fly right)
-                v_lat_des = float(np.clip(K_LAT_POS * by, -V_LAT_MAX, V_LAT_MAX))
-                # Vertical: bz > 0 = gate is below drone (NED); hold for blackout
-                self._last_elev_err = bz
-            else:
-                # Vision dark (passthrough cooldown or no gate).
-                # Maintain gentle forward speed so the drone keeps flying through
-                # the gate and toward the next one instead of braking hard.
-                v_fwd_des = 3.0
-                v_lat_des = 0.0
+            # World-frame elevation error and its vision-derived rate.
+            # gate_pD: NED-down component of gate position relative to drone.
+            #   Positive = gate is below the drone in the world.
+            # elev_rate: d(gate_pD)/dt from consecutive vision frames (m/s).
+            #   Positive = gate moving further below (or drone ascending).
+            #   Used as D term in thrust — replaces IMU vD which accumulates drift.
+            # Guard bx > MIN_BX_FOR_ELEV: below this range the geometry is
+            # unreliable and could corrupt the frozen hold value.
+            MIN_BX_FOR_ELEV = 3.0
+            elev_rate = 0.0
+            if vision_valid and bx > MIN_BX_FOR_ELEV and vis_frame_id is not None:
+                qw, qx, qy, qz = quat
+                gate_pD = (  2*(qx*qz - qw*qy) * bx
+                           + 2*(qy*qz + qw*qx) * by
+                           + (1 - 2*(qx*qx + qy*qy)) * bz)
+                if (self._prev_elev_frame_id is not None
+                        and 0 < vis_frame_id - self._prev_elev_frame_id <= 3):
+                    dt_e = (vis_frame_id - self._prev_elev_frame_id) / 30.0
+                    elev_rate = (gate_pD - self._prev_gate_pD) / dt_e
+                self._prev_gate_pD       = gate_pD
+                self._prev_elev_frame_id = vis_frame_id
+                self._last_elev_err      = gate_pD
+            elif not vision_valid:
+                self._prev_gate_pD       = None
+                self._prev_elev_frame_id = None
 
             # ----------------------------------------------------------------
-            # YAW — steer toward gate center; log tilt for situational awareness.
+            # VELOCITY FUSION — blend IMU strapdown with vision-derived velocity.
+            # Vision runs at 30 Hz; the controller runs at 60 Hz; the same
+            # vision_velocity dict therefore sits in self.data for ~2 controller
+            # ticks before a new frame arrives.  We gate on frame_id so each
+            # vision measurement is blended in exactly once, not twice.
+            # Only vY and vZ are corrected; vX (forward) stays IMU-only because
+            # the forward velocity from range-derivative is already well-damped
+            # by the pitch dynamics and less prone to lateral drift.
             # ----------------------------------------------------------------
+            OF_ALPHA     = 0.7   # IMU weight; 0.3 goes to vision estimate
+            vel_source   = 'imu'
+            if (vision_vel is not None
+                    and vis_frame_id is not None
+                    and vis_frame_id != self._last_fused_frame_id):
+                vY = OF_ALPHA * vY + (1.0 - OF_ALPHA) * vision_vel['vy_body_mps']
+                vZ = OF_ALPHA * vZ + (1.0 - OF_ALPHA) * vision_vel['vz_body_mps']
+                self._last_fused_frame_id = vis_frame_id
+                vel_source = 'fused'
+
+            # ----------------------------------------------------------------
+            # TURN COORDINATION — shared quantities for roll and yaw
+            #
+            # bearing_body : heading angle to gate center (deg, body frame).
+            #                Drives roll (primary turn) and is computed here
+            #                for use in both sections below.
+            # blend        : 1.0 = far from gate (full roll authority)
+            #                0.0 = at gate plane (roll zeroed, yaw aligns)
+            #
+            # Architecture:
+            #   Roll  → primary steering via coordinated bank on bearing angle
+            #   Yaw   → passive; only activates close in for perpendicular crossing
+            # ----------------------------------------------------------------
+            PERP_BLEND_DIST = 6.0    # m: distance at which blend ramp starts
+            TILT_EMA_ALPHA  = 0.25   # EMA weight on new gate_tilt sample
+                                     # Raw noise ±10° → smoothed to ~±4°
+
+            bearing_body  = 0.0      # heading angle to gate, degrees (default 0)
+            blend         = 0.0      # far/close blend factor (default: close, no P)
             gate_tilt_deg = float('nan')
+            yaw_err       = 0.0
+            yaw_mode      = 'no-vision'
+
             if vision_valid:
-                # Goal 3: detect gate tilt from PnP face normal (logged, not used
-                # for navigation — approaching perpendicular to gate face is slower).
-                if vision.get('pnp_ok') and vision.get('pnp_rvec') is not None:
+                # Bearing angle to gate. Wider cap (±25°) than before — this
+                # drives roll, not yaw, so larger corrections are appropriate.
+                bearing_body = float(np.clip(
+                    math.degrees(math.atan2(by, bx)), -25.0, 25.0))
+
+                blend = float(np.clip(bx / PERP_BLEND_DIST, 0.0, 1.0))
+
+                # Bearing rate: d(bearing_body)/dt from consecutive vision frames.
+                # Used as D term for roll — replaces IMU vY which accumulates drift.
+                # Positive = heading error growing (gate drifting further off-axis).
+                # Negative = heading error closing (drone turning toward gate).
+                bearing_rate = 0.0
+                if (vis_frame_id is not None
+                        and self._prev_bearing_frame_id is not None
+                        and 0 < vis_frame_id - self._prev_bearing_frame_id <= 3):
+                    dt_b = (vis_frame_id - self._prev_bearing_frame_id) / 30.0
+                    bearing_rate = (bearing_body - self._prev_bearing_body) / dt_b
+                if vis_frame_id is not None:
+                    self._prev_bearing_body     = bearing_body
+                    self._prev_bearing_frame_id = vis_frame_id
+
+                # ── Gate face normal (PnP rvec → body frame) ──────────────
+                # EMA smoothing reduces the raw ±10° measurement noise to ~±4°
+                # before it feeds the yaw command. EMA resets whenever PnP
+                # drops out so stale values from a different gate don't persist.
+                pnp_ok = vision.get('pnp_ok') and vision.get('pnp_rvec') is not None
+                if pnp_ok:
                     rvec  = np.array(vision['pnp_rvec'], dtype=np.float64)
                     R, _  = cv2.Rodrigues(rvec)
                     n_cam = R @ np.array([0.0, 0.0, 1.0])
-                    if n_cam[2] > 0:       # fix IPPE ambiguity
+                    if n_cam[2] > 0:          # resolve IPPE sign ambiguity
                         n_cam = -n_cam
-                    t = math.radians(20.0); ct, st = math.cos(t), math.sin(t)
-                    n_bx = ct * (-n_cam[2]) + st * (-n_cam[1])
+                    ct20 = math.cos(math.radians(20.0))
+                    st20 = math.sin(math.radians(20.0))
+                    n_bx = ct20 * (-n_cam[2]) + st20 * (-n_cam[1])
                     n_by = -n_cam[0]
-                    gate_tilt_deg = math.degrees(math.atan2(n_by, n_bx))
+                    tilt_raw = float(np.clip(
+                        math.degrees(math.atan2(n_by, n_bx)), -30.0, 30.0))
+                    if self._gate_tilt_ema is None:
+                        self._gate_tilt_ema = tilt_raw
+                    else:
+                        self._gate_tilt_ema = (TILT_EMA_ALPHA * tilt_raw
+                                               + (1.0 - TILT_EMA_ALPHA) * self._gate_tilt_ema)
+                    gate_tilt_deg = self._gate_tilt_ema
+                else:
+                    self._gate_tilt_ema = None
 
-                # Navigation: steer at gate center, cap at ±8° to prevent
-                # atan2 blowup as bx→0 during close approach.
-                bearing_body = math.degrees(math.atan2(by, bx))
-                bearing_body = max(-8.0, min(8.0, bearing_body))
-                gate_world_bearing = yaw_deg + bearing_body
-                yaw_err = (gate_world_bearing - self._last_yaw_des + 180.0) % 360.0 - 180.0
-                self._last_yaw_des += 0.3 * yaw_err
+                # ── Yaw: track gate bearing far out, blend to gate normal close in ──
+                # Keeps the gate in frame throughout the approach.
+                # bearing_body is already capped at ±25° for roll; apply a
+                # tighter ±12° cap for yaw to limit body yaw rate.
+                yaw_bearing = float(np.clip(bearing_body, -12.0, 12.0))
+                if not math.isnan(gate_tilt_deg):
+                    yaw_err  = blend * yaw_bearing + (1.0 - blend) * gate_tilt_deg
+                    yaw_mode = f'blend={blend:.2f}'
+                else:
+                    yaw_err  = yaw_bearing
+                    yaw_mode = 'bearing'
+            else:
+                self._gate_tilt_ema         = None
+                self._prev_bearing_body     = None
+                self._prev_bearing_frame_id = None
+                bearing_rate                = 0.0
 
-            # ----------------------------------------------------------------
-            # VELOCITY FUSION — blend IMU strapdown with gate-position derivative.
-            # Gate is stationary → d(bx,by,bz)/dt gives all three body-frame
-            # velocities directly, no depth ambiguity. Published by vision_rx at
-            # 30 Hz; set to None during passthrough suppression so IMU takes over.
-            # ----------------------------------------------------------------
-            vel_source = 'imu'
-            if vision_vel is not None and vision_vel.get('seq', -1) != self._last_vel_seq:
-                # Fresh camera frame — use camera velocity (+ optional IMU blend).
-                self._last_vel_seq = vision_vel['seq']
-                vX = VEL_IMU_WEIGHT * vX + (1.0 - VEL_IMU_WEIGHT) * vision_vel['vx_body_mps']
-                vY = VEL_IMU_WEIGHT * vY + (1.0 - VEL_IMU_WEIGHT) * vision_vel['vy_body_mps']
-                vZ = VEL_IMU_WEIGHT * vZ + (1.0 - VEL_IMU_WEIGHT) * vision_vel['vz_body_mps']
-                vel_source = 'cam' if VEL_IMU_WEIGHT == 0.0 else 'fused'
-            # Stale camera frame (seq unchanged) or no vision → IMU only.
-
-            # ----------------------------------------------------------------
-            # ATTITUDE SETPOINTS — velocity errors → desired tilt angles
-            # ----------------------------------------------------------------
-            K_VX_P    = 3.5     # deg pitch per m/s forward-speed error
-            K_VY_P    = 6.0     # deg roll  per m/s lateral-speed error
-            PITCH_MAX = 25.0    # deg
-            ROLL_MAX  = 25.0    # deg
-
-            # Forward: vX (body frame) vs desired; nose-down (negative pitch) to accelerate
-            vx_err  = v_fwd_des - vX
-            pitch_des = float(np.clip(-K_VX_P * vx_err, -PITCH_MAX, PITCH_MAX))
-
-            # Lateral: vY (body frame, right positive) vs desired
-            vy_err  = v_lat_des - vY
-            roll_des = float(np.clip(K_VY_P * vy_err, -ROLL_MAX, ROLL_MAX))
-
-            yaw_des = self._last_yaw_des   # held across blackout; reset on arm
 
             # ----------------------------------------------------------------
-            # ATTITUDE COMMANDS — sent directly as quaternion setpoints.
-            # typemask=7 means the autopilot's own IMU loop holds these angles;
-            # we must NOT add an outer feedback loop using AHRS pitch_deg/roll_deg
-            # because AHRS drifts under vibration and makes commands insane.
+            # UNIFIED D TERMS  (lateral and vertical)
+            #
+            # D_lateral  (m/s, body-right positive):
+            #   Damping signal for roll.  Positive = moving right.
+            #   desired_roll = p_lat - K_LAT_D * D_lateral
+            #   → reduces right bank when moving right (brakes overshoot).
+            #
+            # D_vertical  (m/s, NED-down positive):
+            #   Damping signal for thrust.  Positive = moving down.
+            #   thrust += K_D * D_vertical
+            #   → adds thrust when descending (brakes descent overshoot).
+            #   → reduces thrust when climbing (brakes climb overshoot).
+            #
+            # On a new vision frame: derived from the position derivative
+            #   (bearing_rate → lateral velocity; elev_rate → vertical velocity).
+            #   IMU velocity reference is snapshotted so between-frame integration
+            #   always starts from zero.
+            #
+            # Between frames (ONLY): IMU velocity increment since the last
+            #   vision frame.  Integration window is ~16–33 ms so drift is
+            #   negligible; this keeps D active at every 60 Hz controller tick.
+            #
+            # Vision lost: reference is reset so delta starts fresh from 0.
             # ----------------------------------------------------------------
-            pitchCommand = pitch_des   # deg, autopilot drives to this
-            rollCommand  = roll_des    # deg, autopilot drives to this
-            yawCommand   = yaw_des     # deg, absolute world-frame yaw
+            is_new_d_frame = (vision_valid
+                              and vis_frame_id is not None
+                              and vis_frame_id != self._last_d_frame_id)
+
+            if is_new_d_frame:
+                # Convert bearing_rate (deg/s) → lateral velocity (m/s):
+                # bearing ≈ atan(by/bx), so d(bearing)/dt ≈ -vy_body / bx (rad/s)
+                # → vy_body ≈ -bearing_rate_rad * bx
+                bearing_rate_rad = math.radians(bearing_rate)
+                D_lateral  = -bearing_rate_rad * max(bx, 0.5)   # m/s, cap bx to avoid ÷0
+
+                # elev_rate = d(gate_pD)/dt = -vD_drone  (gate moves relatively
+                # lower when drone climbs).  D_vertical = vD_drone = -elev_rate.
+                D_vertical = -elev_rate   # m/s, NED-down positive
+
+                # Snapshot IMU velocities so between-frame delta starts at 0
+                self._vY_at_vision  = vY
+                self._vD_at_vision  = vD
+                self._last_d_frame_id = vis_frame_id
+
+            elif not vision_valid:
+                # Vision lost — reset reference to current IMU so delta stays small
+                D_lateral  = 0.0
+                D_vertical = 0.0
+                self._vY_at_vision  = vY
+                self._vD_at_vision  = vD
+                self._last_d_frame_id = None
+
+            else:
+                # Between vision frames: IMU-integrated increment since last frame
+                D_lateral  = vY - self._vY_at_vision   # m/s
+                D_vertical = vD - self._vD_at_vision   # m/s, NED-down positive
 
             # ----------------------------------------------------------------
-            # THRUST — driven by vision body_z_m; held during blackout.
-            # bz > 0  → gate below drone → descend → less thrust.
-            # vD > 0  → falling → brake → more thrust.
-            # Tilt compensation uses COMMANDED angles (reliable), not AHRS.
+            # ATTITUDE COMMANDS
             # ----------------------------------------------------------------
-            K_P_thrust = 0.06   # was 0.08; reduced to cut altitude overshoot past gate top
-            K_D_thrust = 0.04
+
+            DESIRED_PITCH_DEG = -3.0    # hardcoded forward pitch
+            K_BEARING         =  4.5    # deg bank per deg of bearing error
+            K_LAT_D           =  9    # deg bank per m/s of D_lateral
+            MAX_BANK_DEG      = 25.0
+
+            KP = 1
+            KR = -1
+            KY = -1
+
+            pitchCommand = (DESIRED_PITCH_DEG - pitch_deg) * KP
+
+            # Roll: P on bearing angle, D on lateral velocity (vision + IMU)
+            p_lat = K_BEARING * bearing_body * blend
+            d_lat = K_LAT_D   * D_lateral    * blend
+            desired_roll_deg = float(np.clip(p_lat - d_lat, -MAX_BANK_DEG, MAX_BANK_DEG))
+            rollCommand = (desired_roll_deg - roll_deg) * KR
+
+            yawCommand = yaw_err * KY
+
+            # ----------------------------------------------------------------
+            # THRUST
+            # NED-down convention: D_vertical > 0 → moving down → add thrust
+            #                      D_vertical < 0 → moving up   → reduce thrust
+            # ----------------------------------------------------------------
+            K_P_thrust = 0.014
+            K_D_thrust = 0.0175
+
+            tiltFactor = max(0.01, math.cos(math.radians(roll_deg))
+                                 * math.cos(math.radians(pitch_deg)))
 
             thrustCommand = (HOVER_THRUST
                              - self._last_elev_err * K_P_thrust
-                             + vD * K_D_thrust)
+                             + D_vertical          * K_D_thrust) / tiltFactor
 
-            tiltFactor = max(0.01, math.cos(math.radians(roll_des))
-                                 * math.cos(math.radians(pitch_des)))
+            thrustCommand = float(np.clip(thrustCommand, 0.0, 1.0))
 
             if self._tick % DEBUG_EVERY_N == 0:
-                tilt_str = f'  tilt={gate_tilt_deg:+.0f}°' if not math.isnan(gate_tilt_deg) else ''
-                gate_str = (f'{bx:.1f}m fwd  {by:+.1f}m right  {bz:+.1f}m down{tilt_str}'
-                            if vision_valid else 'no-vision')
+                d_src = 'vis' if is_new_d_frame else ('imu' if vision_valid else 'rst')
                 print(
-                    f'[NAV] vel_{vel_source}=({vX:+5.1f}fwd {vY:+5.1f}R {vZ:+5.1f}D)m/s  '
+                    f'[NAV] vel_{vel_source}=({vX:+6.1f}fwd {vY:+5.1f}right {vZ:+5.1f}down)m/s  '
                     f'att=({roll_deg:+5.1f}r {pitch_deg:+5.1f}p {yaw_deg:+5.1f}y)°  '
-                    f'gate={gate_str}  '
-                    f'des=(p={pitch_des:+5.1f} r={roll_des:+5.1f} '
-                    f'y={yaw_des:+6.1f})°  '
-                    f'cmd=(p={pitchCommand:+5.2f} r={rollCommand:+5.2f} '
+                    f'gate=({bx:+5.1f}fwd {by:+5.1f}right {bz:+5.1f}down)m  '
+                    f'elev={self._last_elev_err:+5.2f}m  '
+                    f'D[{d_src}]=(lat={D_lateral:+5.2f} vert={D_vertical:+5.2f})m/s  '
+                    f'roll=(p={p_lat:+5.1f} d={-d_lat:+5.1f} des={desired_roll_deg:+5.1f})°  '
+                    f'yaw={yaw_mode}  '
+                    f'cmd=(r={rollCommand:+5.2f} p={pitchCommand:+5.2f} '
                     f'y={yawCommand:+5.2f} T={thrustCommand:.3f})',
                     flush=True
                 )
-                if thrustCommand > 1.0:
-                    print('[WARN] thrust clipped — over-angled', flush=True)
+                if thrustCommand >= 0.99:
+                    print('[WARN] thrust saturated high', flush=True)
 
-            thrustCommand = np.clip(thrustCommand, 0, 1)
+
             self._send_attitude_rate(rollCommand, pitchCommand, yawCommand, thrustCommand)
 
             time.sleep(1.0 / CONTROL_HZ)

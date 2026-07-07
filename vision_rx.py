@@ -499,7 +499,6 @@ class VisionRX:
         self._ema_prev   = None     # previous smoothed bbox (EMA state)
         self._pnp_ema    = None     # (tvec, gate_id) — PnP tvec EMA state
         self._prev_bxyz = None   # (bx, by, bz) from previous frame for velocity derivative
-        self._vel_seq   = 0      # increments each time a new velocity is published
         # Gate-passthrough suppression state
         self._in_gate         = False  # True while gate area > threshold (inside gate)
         self._pass_cooldown   = 0      # frames left to suppress after passing through
@@ -620,12 +619,10 @@ class VisionRX:
         if self._prev_bxyz is not None:
             dt = 1.0 / _GATE_VEL_FPS
             pbx, pby, pbz = self._prev_bxyz
-            self._vel_seq += 1
             self.data['vision_velocity'] = {
                 'vx_body_mps': round(-(bx - pbx) / dt, 2),
                 'vy_body_mps': round(-(by - pby) / dt, 2),
                 'vz_body_mps': round(-(bz - pbz) / dt, 2),
-                'seq':         self._vel_seq,
             }
 
         self._prev_bxyz = (bx, by, bz)
@@ -651,16 +648,23 @@ class VisionRX:
             self._instrument(frame_id, img, mask, contours)
 
         # ---- Gate passthrough suppression ----------------------------------------
-        # When the drone enters a gate's close-range zone (contour area grows very
-        # large) the centroid is useless for steering.  Suppress the published
-        # estimate while inside the gate, then hold that suppression for a short
-        # cooldown after the area drops — preventing the controller from locking
-        # back onto the gate it just flew through.
+        # When the drone enters a gate's close-range zone the centroid / PnP
+        # becomes unreliable and we suppress the estimate to avoid bad corrections.
         #
-        # Threshold 12000 px² ≈ gate width ~110 px ≈ range ~8 m.  Cooldown 25 frames
-        # ≈ 0.8 s at 30 fps; at 4 m/s that's ~3 m of forward travel after passthrough.
-        _PASS_AREA_PX     = 12000
-        _PASS_COOLDOWN_FR = 25
+        # Geometry (640×360 image, FX=320, gate outer width=2.7 m):
+        #   projected outer width  px = 320 × 2.7 / d = 864 / d
+        #   contour area (RETR_EXTERNAL traces outer boundary, contourArea
+        #   returns full enclosed outer square) ≈ (864/d)² = 746 496 / d²
+        #
+        #   _PASS_AREA_PX = 80 000  →  d = sqrt(746496/80000) ≈ 3.1 m
+        #     At 3 m the gate is 288×288 px (80 % of the 360 px image height).
+        #     Below ~2.4 m the gate overflows the image height entirely.
+        #
+        #   _PASS_COOLDOWN_FR = 10  →  10/30 ≈ 0.33 s
+        #     At 4 m/s  ≈ 1.3 m travel  (well clear of the gate)
+        #     At 8 m/s  ≈ 2.7 m travel  (enough to clear and find the next gate)
+        _PASS_AREA_PX     = 80000
+        _PASS_COOLDOWN_FR = 10
 
         _raw_area = estimate['area'] if estimate is not None else 0
 
