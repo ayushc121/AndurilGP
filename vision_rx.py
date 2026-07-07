@@ -583,9 +583,6 @@ class VisionRX:
     # Gate detection
     # ------------------------------------------------------------------
 
-    # Physical velocity cap — readings above this indicate a bad PnP frame.
-    _MAX_GATE_VEL_MPS = 25.0
-
     def _gate_velocity(self, estimate):
         """
         Estimate body-frame velocity from the rate of change of the gate's
@@ -595,7 +592,6 @@ class VisionRX:
         Uses the raw (pre-EMA) PnP tvec when available so the EMA lag on
         the navigation estimate doesn't attenuate the velocity signal.
         Falls back to the smoothed body pose when PnP is unavailable.
-        Readings exceeding _MAX_GATE_VEL_MPS are rejected as PnP jumps.
         Publishes to data['vision_velocity']; sets it to None when invalid.
         """
         if estimate is None:
@@ -621,20 +617,12 @@ class VisionRX:
             return
 
         if self._prev_bxyz is not None:
-            dt  = 1.0 / _GATE_VEL_FPS
+            dt = 1.0 / _GATE_VEL_FPS
             pbx, pby, pbz = self._prev_bxyz
-            vx = -(bx - pbx) / dt
-            vy = -(by - pby) / dt
-            vz = -(bz - pbz) / dt
-            # Reject frames where PnP jumped — physically impossible readings.
-            if max(abs(vx), abs(vy), abs(vz)) > self._MAX_GATE_VEL_MPS:
-                self._prev_bxyz = None
-                self.data['vision_velocity'] = None
-                return
             self.data['vision_velocity'] = {
-                'vx_body_mps': round(vx, 2),
-                'vy_body_mps': round(vy, 2),
-                'vz_body_mps': round(vz, 2),
+                'vx_body_mps': round(-(bx - pbx) / dt, 2),
+                'vy_body_mps': round(-(by - pby) / dt, 2),
+                'vz_body_mps': round(-(bz - pbz) / dt, 2),
             }
 
         self._prev_bxyz = (bx, by, bz)
