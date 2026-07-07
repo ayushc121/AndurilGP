@@ -19,6 +19,12 @@ DEBUG_EVERY_N    = 20       # print interval (~3x per s at 60 Hz — reduce once
 HOVER_THRUST     = 0.2635
 MAVLINK_CMD_SIM_RESET = 31000
 
+# Velocity fusion: weight given to IMU strapdown when gate-position derivative
+# is available. 0.0 = camera-only (no IMU blending); 1.0 = IMU-only (no vision).
+# Camera derivative doesn't drift (measures against stationary gate); IMU does.
+# Increase toward 0.5 if gate derivative is noisy (visible in vel_fused= log).
+VEL_IMU_WEIGHT = 0.0
+
 # Known launch attitude — drone always starts on an angled block.
 LAUNCH_PITCH_DEG = -17.8    # NED: negative = nose down
 
@@ -566,13 +572,12 @@ class Controller:
             # velocities directly, no depth ambiguity. Published by vision_rx at
             # 30 Hz; set to None during passthrough suppression so IMU takes over.
             # ----------------------------------------------------------------
-            GATE_ALPHA = 0.5   # equal weight IMU / gate-derivative; tune if needed
             vel_source = 'imu'
             if vision_vel is not None:
-                vX = GATE_ALPHA * vX + (1.0 - GATE_ALPHA) * vision_vel['vx_body_mps']
-                vY = GATE_ALPHA * vY + (1.0 - GATE_ALPHA) * vision_vel['vy_body_mps']
-                vZ = GATE_ALPHA * vZ + (1.0 - GATE_ALPHA) * vision_vel['vz_body_mps']
-                vel_source = 'fused'
+                vX = VEL_IMU_WEIGHT * vX + (1.0 - VEL_IMU_WEIGHT) * vision_vel['vx_body_mps']
+                vY = VEL_IMU_WEIGHT * vY + (1.0 - VEL_IMU_WEIGHT) * vision_vel['vy_body_mps']
+                vZ = VEL_IMU_WEIGHT * vZ + (1.0 - VEL_IMU_WEIGHT) * vision_vel['vz_body_mps']
+                vel_source = 'cam' if VEL_IMU_WEIGHT == 0.0 else 'fused'
 
             # ----------------------------------------------------------------
             # ATTITUDE SETPOINTS — velocity errors → desired tilt angles
