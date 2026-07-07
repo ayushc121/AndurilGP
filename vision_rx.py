@@ -107,19 +107,12 @@ EMA_RESET_WR  = 1.6    # bbox-width ratio (new/prev) beyond this -> reset
 FRAME_BUFFER_DEPTH = 10
 
 # --------------------------------------------------------------------------------------
-# Optical flow velocity estimation
-# Sparse Lucas-Kanade flow between consecutive frames → body-frame lateral + vertical
-# velocity (m/s). Forward velocity (vX) is not estimated — optical axis motion only
-# produces radial divergence, which requires more complex estimation.
-# Published to data['vision_velocity'] = {'vy_body_mps': float, 'vz_body_mps': float,
-#                                          'n_tracks': int, 'depth_m': float}
+# Gate-position velocity estimation
+# Gate is stationary. body_relative_pose() gives its body-frame position each frame.
+# Derivative between consecutive frames: vX=-d(bx)/dt, vY=-d(by)/dt, vZ=-d(bz)/dt.
+# Published to data['vision_velocity'] = {'vx_body_mps', 'vy_body_mps', 'vz_body_mps'}
 # --------------------------------------------------------------------------------------
-_OF_MAX_CORNERS = 60     # feature points to track per frame
-_OF_QUALITY     = 0.01   # minimum quality for goodFeaturesToTrack
-_OF_MIN_DIST_PX = 12     # minimum distance between features (pixels)
-_OF_WIN_SIZE    = (15, 15)
-_OF_MAX_LEVEL   = 3      # pyramid levels for LK
-_OF_FPS         = 30.0   # camera frame rate
+_GATE_VEL_FPS = 30.0   # camera frame rate
 
 # Socket timeout so the thread can notice is_running=False cleanly
 SOCKET_TIMEOUT_S = 1.0
@@ -505,8 +498,7 @@ class VisionRX:
         self._dump_sets  = 0
         self._ema_prev   = None     # previous smoothed bbox (EMA state)
         self._pnp_ema    = None     # (tvec, gate_id) — PnP tvec EMA state
-        self._of_prev_gray   = None   # previous grayscale frame for optical flow
-        self._of_scene_depth = 10.0  # scene depth estimate from gate distance (m)
+        self._prev_bxyz = None   # (bx, by, bz) from previous frame for velocity derivative
         # Gate-passthrough suppression state
         self._in_gate         = False  # True while gate area > threshold (inside gate)
         self._pass_cooldown   = 0      # frames left to suppress after passing through
@@ -591,57 +583,34 @@ class VisionRX:
     # Gate detection
     # ------------------------------------------------------------------
 
-    def _optical_flow_velocity(self, gray):
+    def _gate_velocity(self, estimate):
         """
-        Sparse Lucas-Kanade optical flow between the previous and current frame.
-        Converts median pixel displacement to body-frame lateral (vy) and vertical
-        (vz) velocity using the last known gate distance as the scene depth.
-        Publishes to data['vision_velocity']. No-ops until the second frame.
+        Estimate body-frame velocity from the rate of change of the gate's
+        body-frame position. The gate is stationary, so:
+            vX = -d(bx)/dt,  vY = -d(by)/dt,  vZ = -d(bz)/dt
+        bx/by/bz are already in body frame (camera tilt handled by body_relative_pose).
+        Publishes to data['vision_velocity']; sets it to None when estimate is invalid.
         """
-        if self._of_prev_gray is None:
+        if estimate is None:
+            self._prev_bxyz = None
+            self.data['vision_velocity'] = None
             return
-        features = cv2.goodFeaturesToTrack(
-            self._of_prev_gray,
-            maxCorners=_OF_MAX_CORNERS,
-            qualityLevel=_OF_QUALITY,
-            minDistance=_OF_MIN_DIST_PX,
-            blockSize=7,
-        )
-        if features is None or len(features) < 6:
+        bx = estimate.get('body_x_m', float('nan'))
+        by = estimate.get('body_y_m', float('nan'))
+        bz = estimate.get('body_z_m', float('nan'))
+        if any(math.isnan(v) for v in (bx, by, bz)) or bx <= 0.1:
+            self._prev_bxyz = None
+            self.data['vision_velocity'] = None
             return
-        nxt, status, _ = cv2.calcOpticalFlowPyrLK(
-            self._of_prev_gray, gray, features, None,
-            winSize=_OF_WIN_SIZE, maxLevel=_OF_MAX_LEVEL,
-            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 10, 0.03),
-        )
-        ok   = status.flatten() == 1
-        if ok.sum() < 6:
-            return
-        flow = (nxt[ok] - features[ok]).reshape(-1, 2)
-        dx_px = float(np.median(flow[:, 0]))   # +right in image
-        dy_px = float(np.median(flow[:, 1]))   # +down in image
-
-        Z  = self._of_scene_depth
-        dt = 1.0 / _OF_FPS
-
-        # Translational flow: dx_px = -FX * Tx / Z * dt  (Tx = camera lateral vel)
-        # Camera X (right) = body Y (right) — no tilt correction needed.
-        Tx = -dx_px * Z / (FX * dt)
-        vy_body = Tx
-
-        # Camera Y (down) = body direction [sin20°, 0, cos20°].
-        # dy_px = -FY * Ty / Z * dt  (Ty = camera vertical vel, down positive)
-        # Body Z component = cos(20°) * Ty.
-        Ty = -dy_px * Z / (FY * dt)
-        t  = math.radians(CAM_TILT_DEG)
-        vz_body = math.cos(t) * Ty
-
-        self.data['vision_velocity'] = {
-            'vy_body_mps': round(vy_body, 2),
-            'vz_body_mps': round(vz_body, 2),
-            'n_tracks':    int(ok.sum()),
-            'depth_m':     round(Z, 1),
-        }
+        if self._prev_bxyz is not None:
+            dt = 1.0 / _GATE_VEL_FPS
+            pbx, pby, pbz = self._prev_bxyz
+            self.data['vision_velocity'] = {
+                'vx_body_mps': round(-(bx - pbx) / dt, 2),
+                'vy_body_mps': round(-(by - pby) / dt, 2),
+                'vz_body_mps': round(-(bz - pbz) / dt, 2),
+            }
+        self._prev_bxyz = (bx, by, bz)
 
     def process_frame(self, frame_id, img):
         """
@@ -655,12 +624,6 @@ class VisionRX:
           cx_offset > 0  →  gate is to the RIGHT of image centre
           cy_offset > 0  →  gate is BELOW image centre  (image Y-down)
         """
-        # Optical flow velocity — runs every frame before gate detection so it
-        # always has a prev frame regardless of passthrough suppression.
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        self._optical_flow_velocity(gray)
-        self._of_prev_gray = gray
-
         # Detection logic lives in module-level detect_gate() so the offline replay
         # harness runs the EXACT same pipeline (tuning transfers to flight).
         estimate, mask, contours = detect_gate(img)
@@ -687,7 +650,9 @@ class VisionRX:
             # Drone is inside / immediately in front of the gate.
             if not self._in_gate:
                 self._in_gate = True   # transition: entered gate zone
+            self._prev_bxyz = None
             self.data['vision_gate_estimate'] = None
+            self.data['vision_velocity'] = None
             return None
 
         if self._in_gate:
@@ -697,10 +662,12 @@ class VisionRX:
             self._pass_cooldown = _PASS_COOLDOWN_FR
             self._ema_prev      = None
             self._pnp_ema       = None
+            self._prev_bxyz     = None
 
         if self._pass_cooldown > 0:
             self._pass_cooldown -= 1
             self.data['vision_gate_estimate'] = None
+            self.data['vision_velocity'] = None
             return None
         # --------------------------------------------------------------------------
 
@@ -731,11 +698,8 @@ class VisionRX:
         # These allow Round-2 controllers to steer without attitude/position data.
         body_relative_pose(estimate)
 
-        # Update scene depth for next frame's optical flow scale.
-        if estimate is not None:
-            bx = estimate.get('body_x_m', float('nan'))
-            if not math.isnan(bx) and bx > 0.5:
-                self._of_scene_depth = bx
+        # Velocity from gate-position derivative (vX, vY, vZ all three axes).
+        self._gate_velocity(estimate)
 
         if estimate is None:
             self.data['vision_gate_estimate'] = None
