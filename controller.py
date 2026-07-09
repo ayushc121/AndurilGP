@@ -6,6 +6,7 @@ import cv2
 from enum import Enum, auto
 from pymavlink import mavutil
 
+# pipeline-test comment 2026-07-08
 # -----------------------------------------------------------------------
 # Configuration
 # -----------------------------------------------------------------------
@@ -16,6 +17,17 @@ ESTIMATION_POLL_HZ = 400    # estimation thread poll rate — catches every 120 
 ARM_RETRY_S      = 1.0
 POST_DISARM_WAIT = 0.25
 DEBUG_EVERY_N    = 20       # print interval (~3x per s at 60 Hz — reduce once tuned)
+
+# Stall/crash watchdog: the sim does not always flip `armed` to False after a
+# tumble-crash (drone can land on its side/back and just sit there, motors
+# still "armed" at near-zero commanded thrust, forever). Detected instead from
+# telemetry: attitude tumbled past vertical AND ground-speed near zero, held
+# for STALL_SUSTAIN_S. On trip, force a disarm command so the existing
+# disarm/re-arm state machine (and anything grepping run.log for "Disarm
+# detected") sees a normal end-of-flight, instead of main.py hanging silently.
+STALL_TILT_DEG   = 60.0   # |roll| or |pitch| beyond this = drone is not upright
+STALL_SPEED_MPS  = 0.5    # NED speed below this = not actually flying
+STALL_SUSTAIN_S  = 3.0
 HOVER_THRUST     = 0.2635
 MAVLINK_CMD_SIM_RESET = 31000
 
@@ -23,7 +35,7 @@ MAVLINK_CMD_SIM_RESET = 31000
 # is available. 0.0 = camera-only (no IMU blending); 1.0 = IMU-only (no vision).
 # Camera derivative doesn't drift (measures against stationary gate); IMU does.
 # Increase toward 0.5 if gate derivative is noisy (visible in vel_fused= log).
-VEL_IMU_WEIGHT = 0.0
+VEL_IMU_WEIGHT = 0.4
 
 # Known launch attitude — drone always starts on an angled block.
 LAUNCH_PITCH_DEG = -17.8    # NED: negative = nose down
@@ -182,6 +194,8 @@ class Controller:
         self._gate_normal_ema   = None  # smoothed yaw offset from gate face normal (deg)
         self._flying_started    = False # True after first FLYING tick — seeds yaw_des
         self._last_vel_seq      = -1    # last camera velocity seq seen; -1 = none yet
+        self._stall_since       = None  # set when tumbled+stopped first observed
+        self._tumble_since      = None  # set when tumbled at any speed; catches high-speed tumbles
 
         self._reset_flight_state()
 
@@ -501,6 +515,32 @@ class Controller:
                 cmd_thrust  = self._last_cmd_thrust
                 max_net     = self._last_max_net
 
+            # Stall/crash watchdog — see STALL_* constants above.
+            speed_ned = math.sqrt(vN*vN + vE*vE + vD*vD)
+            tilt_mag  = math.sqrt(roll_deg**2 + pitch_deg**2)
+            tumbled   = tilt_mag > STALL_TILT_DEG
+            if tumbled:
+                if self._tumble_since is None:
+                    self._tumble_since = time.time()
+            else:
+                self._tumble_since = None
+            tumble_secs = (time.time() - self._tumble_since) if self._tumble_since else 0.0
+            # Fire on: (tumbled AND stopped) OR (tumbled at any speed for 2s)
+            fire = tumbled and (speed_ned < STALL_SPEED_MPS or tumble_secs >= 2.0)
+            if fire:
+                if self._stall_since is None:
+                    self._stall_since = time.time()
+                elif time.time() - self._stall_since >= STALL_SUSTAIN_S:
+                    print(f'[WATCHDOG] Stall/crash detected — tumbled (roll={roll_deg:.1f}° '
+                          f'pitch={pitch_deg:.1f}°) speed={speed_ned:.1f}m/s tumble_secs={tumble_secs:.1f}. '
+                          f'Forcing disarm.', flush=True)
+                    self._send_disarm()
+                    self._stall_since = None
+                    time.sleep(1.0 / CONTROL_HZ)
+                    return
+            else:
+                self._stall_since = None
+
             # Seed yaw_des from actual AHRS yaw on the very first FLYING tick.
             # Prevents a 0° vs actual-yaw mismatch from causing an instant spin.
             if not self._flying_started:
@@ -513,8 +553,9 @@ class Controller:
             # GUIDANCE — gate-relative position from vision
             # ----------------------------------------------------------------
             # Guidance gains
-            K_FWD_POS  = 0.25    # desired fwd speed (m/s) per metre of gate distance
-            V_FWD_MAX  = 6.0     # m/s forward speed cap
+            K_FWD_POS  = 0.12    # desired fwd speed (m/s) per metre of gate distance
+            V_FWD_MIN  = 9.0     # minimum through-gate speed — never brake to a crawl on approach
+            V_FWD_MAX  = 14.0    # m/s forward speed cap (above natural approach speed)
             K_LAT_POS  = 1.2    # desired lateral speed (m/s) per metre of lateral offset
             V_LAT_MAX  = 3.0    # m/s lateral speed cap
 
@@ -530,7 +571,7 @@ class Controller:
 
             if vision_valid:
                 # Forward distance → desired forward speed (auto-slows on close approach)
-                v_fwd_des = float(np.clip(K_FWD_POS * bx, 0.0, V_FWD_MAX))
+                v_fwd_des = float(np.clip(K_FWD_POS * bx, V_FWD_MIN, V_FWD_MAX))
                 # Lateral offset → desired lateral speed (positive by = gate right → fly right)
                 v_lat_des = float(np.clip(K_LAT_POS * by, -V_LAT_MAX, V_LAT_MAX))
                 # Vertical: bz > 0 = gate is below drone (NED); hold for blackout
@@ -587,7 +628,7 @@ class Controller:
             # ----------------------------------------------------------------
             # ATTITUDE SETPOINTS — velocity errors → desired tilt angles
             # ----------------------------------------------------------------
-            K_VX_P    = 3.5     # deg pitch per m/s forward-speed error
+            K_VX_P    = 1.2     # deg pitch per m/s forward-speed error
             K_VY_P    = 6.0     # deg roll  per m/s lateral-speed error
             PITCH_MAX = 25.0    # deg
             ROLL_MAX  = 25.0    # deg
@@ -600,7 +641,30 @@ class Controller:
             vy_err  = v_lat_des - vY
             roll_des = float(np.clip(K_VY_P * vy_err, -ROLL_MAX, ROLL_MAX))
 
+            # Pitch-angle clamp: once braking has tilted the nose past 30° nose-up,
+            # stop commanding further nose-up (allow nose-down recovery to pass through).
+            PITCH_CLAMP_DEG = 30.0
+            if pitch_deg > PITCH_CLAMP_DEG and pitch_des > 0.0:
+                pitch_des = 0.0
+
+            # Roll-angle clamp: sustained lateral rate commands accumulate to 20°+ via
+            # the rate interface; clamp the same way to prevent exit tumble after gate 0.
+            ROLL_CLAMP_DEG = 20.0
+            if roll_deg > ROLL_CLAMP_DEG and roll_des > 0.0:
+                roll_des = 0.0
+            elif roll_deg < -ROLL_CLAMP_DEG and roll_des < 0.0:
+                roll_des = 0.0
+
             yaw_des = self._last_yaw_des   # held across blackout; reset on arm
+
+            # During vision blackout: hold current attitude (zero rate command) so
+            # the IMU velocity spike after passthrough cannot drive sustained braking.
+            # vX from IMU is unreliable during passthrough; zero rates let the inner
+            # loop maintain whatever pitch/roll the drone had when vision was lost.
+            if not vision_valid:
+                pitch_des = 0.0
+                roll_des  = 0.0
+                yaw_des   = 0.0
 
             # ----------------------------------------------------------------
             # ATTITUDE COMMANDS — sent directly as quaternion setpoints.
@@ -608,8 +672,8 @@ class Controller:
             # we must NOT add an outer feedback loop using AHRS pitch_deg/roll_deg
             # because AHRS drifts under vibration and makes commands insane.
             # ----------------------------------------------------------------
-            pitchCommand = pitch_des   # deg, autopilot drives to this
-            rollCommand  = roll_des    # deg, autopilot drives to this
+            pitchCommand = pitch_des    # deg, autopilot drives to this
+            rollCommand  = -roll_des   # sim roll axis is sign-inverted vs NED
             yawCommand   = yaw_des     # deg, absolute world-frame yaw
 
             # ----------------------------------------------------------------
@@ -621,8 +685,9 @@ class Controller:
             K_P_thrust = 0.06   # was 0.08; reduced to cut altitude overshoot past gate top
             K_D_thrust = 0.04
 
+            elev_err_clamped = float(np.clip(self._last_elev_err, -2.0, 2.0))
             thrustCommand = (HOVER_THRUST
-                             - self._last_elev_err * K_P_thrust
+                             - elev_err_clamped * K_P_thrust
                              + vD * K_D_thrust)
 
             tiltFactor = max(0.01, math.cos(math.radians(roll_des))
@@ -659,4 +724,11 @@ class Controller:
             self.sim_conn.target_system, self.sim_conn.target_component,
             mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
             0, 1, 0, 0, 0, 0, 0, 0
+        )
+
+    def _send_disarm(self):
+        self.sim_conn.mav.command_long_send(
+            self.sim_conn.target_system, self.sim_conn.target_component,
+            mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+            0, 0, 0, 0, 0, 0, 0, 0
         )

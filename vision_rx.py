@@ -3,6 +3,7 @@ import os
 import socket
 import struct
 import threading
+# trivial test comment — build/reset/run cycle check
 
 import cv2
 import numpy as np
@@ -620,6 +621,14 @@ class VisionRX:
         if self._prev_bxyz is not None:
             dt = 1.0 / _GATE_VEL_FPS
             pbx, pby, pbz = self._prev_bxyz
+            delta_sq = (bx-pbx)**2 + (by-pby)**2 + (bz-pbz)**2
+            # Reject frames where the gate centroid jumps more than 0.5m in one
+            # frame (> 15 m/s implied velocity = detection glitch, not real motion).
+            # Keep _prev_bxyz at last-good to avoid propagating the bad position.
+            _GATE_DELTA_MAX_M = 0.5
+            if delta_sq > _GATE_DELTA_MAX_M ** 2:
+                self.data['vision_velocity'] = None
+                return
             self._vel_seq += 1
             self.data['vision_velocity'] = {
                 'vx_body_mps': round(-(bx - pbx) / dt, 2),
@@ -657,9 +666,9 @@ class VisionRX:
         # cooldown after the area drops — preventing the controller from locking
         # back onto the gate it just flew through.
         #
-        # Threshold 12000 px² ≈ gate width ~110 px ≈ range ~8 m.  Cooldown 25 frames
+        # Threshold 80000 px² ≈ gate width ~283 px ≈ range ~3 m.  Cooldown 25 frames
         # ≈ 0.8 s at 30 fps; at 4 m/s that's ~3 m of forward travel after passthrough.
-        _PASS_AREA_PX     = 12000
+        _PASS_AREA_PX     = 80000
         _PASS_COOLDOWN_FR = 25
 
         _raw_area = estimate['area'] if estimate is not None else 0
