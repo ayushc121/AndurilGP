@@ -1,5 +1,5 @@
 # AI Grand Prix — Autonomous Drone Racing Client
-### Branch: `sysid` — Grey-Box System Identification & Gain Schedule
+### Branch: `systemIdentification` — Grey-Box System Identification & Gain Schedule
 
 This branch extends the baseline autonomy stack with a complete grey-box system identification pipeline. The output is `gain_schedule.mat`, a set of 11 linearized state-space models (A, B matrices) covering the drone's full flight envelope. These models are the foundation for the LTV-MPC outer-loop planner under development on the next branch.
 
