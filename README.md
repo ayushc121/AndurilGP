@@ -2,6 +2,8 @@
 
 A Python autonomy stack for the AI Grand Prix Virtual Qualifier. The client connects to the DCL race simulator over MAVLink/UDP, receives telemetry and a live FPV camera stream, and flies the drone through a sequential gate course with zero human input.
 
+We developed a robust state estimation and gate detection pipeline that enables real-time autonomous course navigation by fusing live computer vision feeds with accelerometer and gyroscope sensor data. The system tracks gate geometry continuously through the approach, uses vision-derived position derivatives as damping signals, and blends optical-flow velocity estimates with IMU dead-reckoning to maintain stable closed-loop control throughout the course.
+
 ---
 
 ## Table of Contents
@@ -14,6 +16,7 @@ A Python autonomy stack for the AI Grand Prix Virtual Qualifier. The client conn
 - [Running](#running)
 - [Configuration & Tuning](#configuration--tuning)
 - [Control System Design](#control-system-design)
+- [State Estimation Pipeline](#state-estimation-pipeline)
 - [Vision Pipeline](#vision-pipeline)
 - [Coordinate Frames](#coordinate-frames)
 - [Known Simulator Behaviours](#known-simulator-behaviours)
@@ -23,12 +26,14 @@ A Python autonomy stack for the AI Grand Prix Virtual Qualifier. The client conn
 
 ## Overview
 
-The simulator exposes two interfaces: a MAVLink endpoint on UDP port 14550 for telemetry and control commands, and a JPEG-over-UDP stream on port 5600 for the forward-facing FPV camera. This client consumes both, fuses them, and outputs `SET_ATTITUDE_TARGET` commands at 50 Hz to fly the drone through each gate in order.
+The simulator exposes two interfaces: a MAVLink endpoint on UDP port 14550 for telemetry and control commands, and a JPEG-over-UDP stream on port 5600 for the forward-facing FPV camera. This client consumes both, fuses them, and outputs `SET_ATTITUDE_TARGET` commands at 60 Hz to fly the drone through each gate in order.
 
-The intended pipeline, as described in the competition technical specification, is:
+The pipeline:
 
 ```
-Vision + Telemetry → Perception → Planning → Control → Pilot Commands → Stabilised Controller
+Vision (30 Hz) ──────────────────────────────────────────┐
+                                                          ▼
+IMU (120 Hz) → SMA filter → Gyro AHRS → Strapdown DR → Sensor Fusion → Controller (60 Hz) → Sim
 ```
 
 ---
@@ -38,19 +43,19 @@ Vision + Telemetry → Perception → Planning → Control → Pilot Commands �
 All components run on separate threads and communicate through a single shared dictionary (`shared_data`) protected by a `threading.Lock`.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         shared_data (dict)                      │
-│  odometry · attitude · race_status · gates · imu · collision    │
-│  clock_offset_ns · armed · motor_feedback · vision_gate_estimate│
-└─────────────────────────────────────────────────────────────────┘
-        ▲                  ▲                        ▲
-        │                  │                        │
-  MAVLinkRX          VisionRX                  Controller
-  (MAVLink thread)   (UDP/camera thread)       (control thread)
-        ▲                                          │
-        │                                          ▼
-  sim (UDP :14550)                    SET_ATTITUDE_TARGET → sim
-  sim (UDP :5600)  ←─────────────────────────────────────────────
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           shared_data (dict)                            │
+│  imu · armed · race_status · gates · vision_gate_estimate               │
+│  vision_velocity · last_collision · clock_offset_ns · motor_feedback    │
+└─────────────────────────────────────────────────────────────────────────┘
+        ▲                    ▲                           ▲
+        │                    │                           │
+  MAVLinkRX            VisionRX                    Controller
+  (MAVLink thread)     (UDP/camera thread)         (control + estimation)
+        ▲                                               │
+        │                                               ▼
+  sim (UDP :14550)                       SET_ATTITUDE_TARGET → sim
+  sim (UDP :5600)  ←────────────────────────────────────────────────────
 ```
 
 The `TimeSync` and `HeartbeatSender` threads also run in the background, keeping the MAVLink session alive and measuring the sim-to-client clock offset.
@@ -95,25 +100,28 @@ Sends `TIMESYNC` requests at 10 Hz. The response is handled in `MAVLinkRX.on_tim
 
 ### `vision_rx.py`
 
-Background thread that receives chunked JPEG packets on UDP port 5600, reassembles frames, decodes them with OpenCV, and runs gate detection. Each decoded frame is passed to `process_frame`, which:
+Background thread that receives chunked JPEG packets on UDP port 5600, reassembles frames, decodes them with OpenCV, and runs gate detection at 30 Hz. Each decoded frame is passed to `process_frame`, which:
 
 1. Converts the image to HSV colour space.
 2. Thresholds for the gate's red colour using two hue ranges (H 0–10 and H 170–180) combined with `cv2.bitwise_or`, because red wraps around the HSV hue circle.
 3. Applies morphological close and open operations to clean the mask.
 4. Finds the largest contour above a minimum area threshold.
-5. Stores bounding box and centroid data in `shared_data['vision_gate_estimate']`.
+5. Estimates gate range using the known outer gate width and the pinhole camera model.
+6. Computes PnP pose estimation (`pnp_ok`, `pnp_rvec`) for gate-normal yaw alignment.
+7. Derives an optical-flow body-frame velocity estimate (`vision_velocity`) from consecutive frame positions.
+8. Stores bounding box, centroid, body-frame gate position, PnP result, and velocity in `shared_data`.
 
 Partial frames that never complete (from dropped UDP packets) are pruned after `FRAME_BUFFER_DEPTH` newer frame IDs have arrived.
 
 ### `controller.py`
 
-The core autonomy logic. Runs at 50 Hz. Implements a three-phase state machine:
+The core autonomy logic. Runs at 60 Hz on the main control thread, with a dedicated 400 Hz estimation thread processing every IMU sample. Implements a three-phase state machine:
 
-**`WAIT_FOR_DATA`** — Retries the arm command every second until the heartbeat confirms armed status and an odometry packet has been received.
+**`WAIT_FOR_DATA`** — Retries the arm command every second until the heartbeat confirms armed status and an IMU packet has been received.
 
-**`WAIT_FOR_START`** — Holds completely still (sends no commands) until the race has officially started. Uses a sim-clock anchor to reject stale `race_start_boot_time_ms` values left in the UDP buffer from previous sessions.
+**`WAIT_FOR_START`** — Sends zero commands until the race has officially started. Uses a sim-clock anchor to reject stale `race_start_boot_time_ms` values from previous sessions.
 
-**`FLYING`** — Full autonomy. See [Control System Design](#control-system-design) and [Vision Pipeline](#vision-pipeline).
+**`FLYING`** — Full autonomy. See [Control System Design](#control-system-design), [State Estimation Pipeline](#state-estimation-pipeline), and [Vision Pipeline](#vision-pipeline).
 
 ---
 
@@ -152,13 +160,13 @@ Setting up timesync loop...
 Listening for camera frames...
 Arming drone...
 Sending arm command...
-Armed and data ready. Moving to WAIT_FOR_START.
+IMU estimation thread started.
+Armed and IMU ready. Moving to WAIT_FOR_START.
 [WAIT] Anchor set: sim_ms=1157476
 [WAIT] sim_ms=1157476  race_start=-1  fresh=False  go=False
 ...
 Countdown complete! Flying!
-Track data received: 6 gates
-[GATE] track packet: 6 gates, drone@receipt=(0.00,0.00,0.02)
+[NAV] vel_fused=(  +3.1fwd  -0.0right  -0.0down)m/s  att=( -0.0r  -3.0p  -0.0y)°  gate=(+22.5fwd ...
 ```
 
 If the simulator is on a different machine, update these two constants at the top of `main.py`:
@@ -174,104 +182,213 @@ SIM_SERVER_UDP_PORT = 14550
 
 All primary tuning parameters are constants at the top of `controller.py`.
 
+### Accelerometer Filter
+
+```python
+ACC_SMOOTH_N = 5   # SMA window size over raw body-frame IMU readings
+```
+
+A 5-sample sliding window at 120 Hz corresponds to a ~42 ms smoothing window and ~17 ms group delay. Reduce for faster response; increase to suppress more noise. Set to 1 to disable.
+
+### Vision–IMU Velocity Fusion
+
+```python
+VIS_VEL_EMA_ALPHA = 0.35   # EMA weight on each new raw optical-flow sample
+OF_ALPHA          = 0.6    # IMU weight in final fused velocity (0 = all vision)
+```
+
+`VIS_VEL_EMA_ALPHA` pre-smooths the raw vision velocity before it is blended with the IMU estimate. `OF_ALPHA` controls how much the fused result leans on the IMU vs smoothed vision. Only lateral (vY) and body-down (vZ) channels are corrected; forward velocity (vX) stays IMU-only.
+
+### D Term Clamps
+
+```python
+BEARING_RATE_CLAMP_DEG_S = 60.0   # max bearing-angle rate into D_lateral
+ELEV_RATE_CLAMP_M_S      = 5.0    # max gate elevation rate into D_vertical
+```
+
+These bound the vision finite-difference D signals before they feed commands. Bad gate detections can produce apparent rates of 100+ deg/s; the clamps prevent those from reaching the actuators.
+
 ### Thrust
 
 ```python
-thrust_trim = 0.265   # hover thrust — increase if sinking, decrease if climbing
-K_P_thrust  = 0.0925  # altitude P gain
-K_D_thrust  = 0.05    # altitude D gain (damps vertical oscillation)
+HOVER_THRUST = 0.264   # hover trim — the tilt compensation divides by this
+K_P_thrust   = 0.014   # gate elevation P gain
+K_D_thrust   = 0.0175  # vertical velocity D gain
 ```
 
-`thrust_trim` is the most important value to tune first. Hold the drone at a fixed altitude command and adjust until it hovers level. The tilt compensation factor (`1 / (1 - 2*(qx² + qy²))`) automatically scales thrust up when the drone is banked to preserve vertical lift.
+`HOVER_THRUST` is the physical trim point at level hover. The tilt compensation factor (`cos(roll) × cos(pitch)`) scales thrust automatically when banked. `K_P_thrust` drives toward the gate's world-frame elevation; `K_D_thrust` damps vertical velocity.
 
-### Pitch (north velocity control)
-
-```python
-K_VX_P      = 1.5     # desired pitch per unit of north velocity error (deg / m·s⁻¹)
-K_VX_D      = 0.0
-PITCH_LIMIT = 50.0    # maximum pitch angle (deg)
-K_P_pitch   = 0.015   # inner attitude P gain
-K_D_pitch   = 0.001   # inner attitude D gain
-```
-
-### Roll (east velocity control)
+### Attitude and Steering
 
 ```python
-K_VY_P     = 30.0    # desired roll per unit of east velocity error (deg / m·s⁻¹)
-K_VY_D     = 7.25
-ROLL_LIMIT = 50.0
-K_P_roll   = 0.015
-K_D_roll   = 0.001025
-```
-
-### Yaw
-
-```python
-K_P_yaw = 0.03   # heading P gain
-K_D_yaw = 0.002  # heading D gain
-```
-
-Yaw targets a fixed world heading (currently 180° — due south). For gate racing this can be replaced with a bearing-to-gate setpoint.
-
-### Navigation
-
-```python
-V_MAX  = 20.0   # horizontal speed cap (m/s)
-K_POS  = 1.7    # position-to-velocity P gain (m·s⁻¹ per m)
+DESIRED_PITCH_DEG = -3.0    # fixed forward pitch setpoint
+K_BEARING         = 4.5     # deg bank per deg of bearing error
+K_LAT_D           = 9.0     # deg bank per m/s of lateral D term
+MAX_BANK_DEG      = 25.0    # roll authority hard limit
+PERP_BLEND_DIST   = 6.0     # m: gate distance at which blend ramp starts
+TILT_EMA_ALPHA    = 0.25    # EMA weight on PnP gate-normal tilt measurement
 ```
 
 ---
 
 ## Control System Design
 
-The controller implements a two-stage cascade from position to attitude, outputting `SET_ATTITUDE_TARGET` commands to the flight controller.
+The controller operates a rate-command interface: `SET_ATTITUDE_TARGET` with typemask `0b00000111`, interpreted by the sim as direct body rates (rad/s). An explicit outer attitude P loop converts angle errors to rate commands:
 
 ```
-NED position error
-        │
-        ▼  (K_POS · error, capped at V_MAX)
-Desired world velocity (north / east)
-        │
-        ▼  (K_VX_P/D, K_VY_P/D)
-Desired attitude (pitch / roll angles)
-        │
-        ▼  (K_P_pitch/D, K_P_roll/D — inner attitude loop)
-Rate commands (rad/s) + thrust  →  SET_ATTITUDE_TARGET
+rate_cmd = angle_error × K_ATT   (clipped to max rate)
 ```
 
-**Body → world velocity transform.** The odometry message provides velocities in the sensor/body frame. Before use in the north/east controllers, these are rotated into the NED world frame using the full quaternion rotation matrix derived from the odometry quaternion. This ensures velocity errors are computed in consistent world-frame axes regardless of the drone's orientation.
+### Steering architecture
 
-**Tilt-compensated thrust.** Collective thrust is scaled by `1 / cos²(tilt)` — approximated as `1 / (1 - 2*(qx² + qy²))` — so that the vertical component of thrust remains equal to the altitude setpoint demand even when the drone is pitched or rolled significantly.
+```
+Gate bearing angle  ──(K_BEARING × blend)──▶ desired roll
+Lateral D term      ──(K_LAT_D   × blend)──▶ desired roll  (subtracted)
+                                                    │
+                                                    ▼
+                                          (desired_roll − roll) × KR  →  roll_cmd
 
-**Disarm / restart handling.** When the `armed` flag drops to False (sim reset or crash), the controller immediately stops sending commands, clears stale telemetry from `shared_data`, resets the state machine, and waits `POST_DISARM_WAIT` seconds before attempting to re-arm. This prevents "please lower throttle" warnings from the simulator.
+Gate bearing (capped)  ──────────────────▶ yaw_err (far field)
+Gate face normal (PnP) ──(1 − blend)────▶ yaw_err (near field, blended in)
+                                                    │
+                                                    ▼
+                                         yaw_err × KY  →  yaw_cmd
+
+HOVER_THRUST − elev_err × K_P_thrust + D_vertical × K_D_thrust
+                                        ──────────────────────▶ thrust_cmd
+                                         (divided by tiltFactor)
+```
+
+**Roll** is the primary steering actuator. The drone steers via coordinated bank, with bearing angle to the gate as the P term. The D term (`D_lateral`) damps overshoot. Both are scaled by `blend`, which ramps from 1.0 (far from gate, full authority) to 0.0 (at the gate plane, roll zeroed).
+
+**Yaw** is passive: it tracks the bearing angle in the far field and blends to the PnP-derived gate face normal close in, ensuring the drone crosses the gate perpendicular to its plane.
+
+**Thrust** is driven by `_last_elev_err`, the world-frame elevation of the gate center relative to the drone, with `D_vertical` providing damping. The elevation error is frozen at its last valid value whenever the gate is out of frame, giving stable hold through brief vision blackouts.
+
+**Pitch** holds a fixed forward angle (`DESIRED_PITCH_DEG`), maintaining forward progress throughout the course.
+
+---
+
+## State Estimation Pipeline
+
+State estimation runs on a dedicated 400 Hz background thread, independently of the 60 Hz control loop. All state writes are protected by `_state_lock`; the control loop takes a single atomic snapshot at the start of each tick and then releases the lock before any computation.
+
+### Attitude — GyroAHRS
+
+Attitude is tracked by a pure quaternion gyro integrator (`GyroAHRS`). At each 120 Hz IMU sample:
+
+```
+q_new = q + 0.5 × dt × Ω(gx, gy, gz) × q   (quaternion kinematics)
+```
+
+The quaternion is renormalised after each step. No accelerometer correction is applied to attitude — the accelerometer is dominated by thrust-induced specific force during manoeuvres, making complementary correction unreliable in a racing context. The gyro is seeded at arm time from the known launch-ramp geometry (`LAUNCH_PITCH_DEG = -17.8°`).
+
+Gyro signs are inverted from NED convention in this simulator and are corrected on ingestion:
+
+```python
+gx = -imu['xgyro']
+gy = -imu['ygyro']
+gz = -imu['zgyro']
+```
+
+### Accelerometer — SMA Filter
+
+Raw body-frame accelerometer readings pass through a sliding-window simple moving average (`ACC_SMOOTH_N = 5` samples) before use. This was chosen over a thrust-proportional physical cap because the cap was found to have a floor discontinuity at low thrust that produced spikes rather than suppressing them. The SMA operates in body frame, before the rotation to NED, preserving the natural frame of the measurement.
+
+```python
+self._acc_buf.append((ax_raw, ay_raw, az_raw))
+ax = mean of buffer x-samples   # smoothed body-frame reading
+```
+
+### Strapdown Dead-Reckoning
+
+After attitude update and accelerometer smoothing, specific force is rotated from body to NED using the current quaternion, gravity is subtracted, and the result is integrated into velocity and position:
+
+```
+a_NED = R(q) · f_body
+a_NED[2] += G          # subtract NED-down gravity
+vel_NED  += a_NED · dt
+pos_NED  += vel_NED · dt
+vel_body  = R(q)ᵀ · vel_NED
+```
+
+Dead-reckoning accumulates gyro-bias-induced drift over time and is not used as an absolute reference. It provides short-term velocity estimates between vision frames, which are corrected at each camera update.
+
+### Vision–IMU Velocity Fusion
+
+At each new 30 Hz camera frame, optical-flow body-frame velocity estimates are pre-smoothed with a per-axis EMA and then blended into the IMU velocity:
+
+```
+vy_ema  = α · vy_raw + (1−α) · vy_ema          # α = VIS_VEL_EMA_ALPHA = 0.35
+vY_fused = β · vY_imu + (1−β) · vy_ema          # β = OF_ALPHA = 0.6
+```
+
+This corrects lateral and vertical IMU drift at 30 Hz while preserving IMU dynamics between frames. Each frame is fused exactly once, gated on `frame_id`. Forward velocity (vX) remains IMU-only; it is less prone to lateral drift and is damped by pitch dynamics.
+
+### D Term Computation
+
+Vision-derived D terms are computed on each new camera frame and held between frames using IMU velocity increments:
+
+```
+On new vision frame:
+    D_lateral  = −clamp(bearing_rate, ±60°/s) × bx   [capped at ±60 °/s]
+    D_vertical = −clamp(elev_rate, ±5 m/s)
+    snapshot: vY_at_vision, vD_at_vision = vY, vD
+
+Between frames (IMU fallback, ~33 ms window):
+    D_lateral  = vY − vY_at_vision
+    D_vertical = vD − vD_at_vision
+
+Vision lost:
+    D_lateral = D_vertical = 0.0   (reference reset)
+```
+
+The clamps on vision finite-difference rates prevent large position jumps between detections (e.g., gate switching) from generating actuator-saturating D spikes.
 
 ---
 
 ## Vision Pipeline
 
-When `vision_gate_estimate` is populated by `VisionRX`, the controller back-projects the gate bounding box into a 3D NED world position using the following chain:
+### Gate Detection
 
-**1. True bounding box centre.** The centroid of the detected red contour can be misleading for a hollow rectangular gate frame (the centroid falls at the empty interior). Instead, the geometric centre of the bounding rectangle is used: `true_cx = bx + bw/2`, `true_cy = by + bh/2`.
+`VisionRX` detects the gate's red frame in each camera frame using HSV thresholding across both red hue ranges (0–10 and 170–180), morphological cleanup, and largest-contour selection.
 
-**2. Range estimation from known gate width.** The gate outer width is 2.7 m. Using the horizontal pinhole formula:
-```
-z_dist_cam = (2.7 × fx) / bw
-```
-This gives the perpendicular distance to the gate plane in camera-frame Z. The full 3D hypotenuse distance to the centre of the gate is then:
-```
-est_distance_3d = z_dist_cam × (|ray| / ray_z)
-```
+### Body-Frame Gate Position
 
-**3. Camera → body rotation.** The camera is tilted 20° upward from the body frame (per the spec). The ray direction is rotated by −20° around the body Y axis:
+The gate's body-frame position `(bx, by, bz)` is estimated from the detected bounding box using the pinhole camera model and known gate outer width (2.7 m):
+
 ```
-rb_x = rc_z·cos(20°) + rc_y·sin(20°)
-rb_y = rc_x
-rb_z = −rc_z·sin(20°) + rc_y·cos(20°)
+z_dist = (gate_width × fx) / bounding_box_width
+ray_body = rotate_cam_to_body(pixel_ray)   # −20° tilt correction
+(bx, by, bz) = z_dist × ray_body / |ray_body|
 ```
 
-**4. Body → NED rotation.** The body-frame ray is rotated to NED using the sequential roll → pitch → yaw rotation matrices derived from the current IMU Euler angles.
+`bx > 0` means the gate is ahead in body frame; `vision_valid` is set only when `bx > 0.1 m`.
 
-**5. Gate NED position.** The 3D range is projected along the world-frame ray and added to the drone's current NED position.
+### Elevation Error
+
+The world-frame elevation of the gate center relative to the drone is extracted by rotating the body-frame gate vector into NED using the current attitude quaternion:
+
+```
+gate_pD = R(q) · [bx, by, bz]  →  NED-down component
+```
+
+This is the elevation error fed to the thrust P term. It is updated only when `bx > MIN_BX_FOR_ELEV = 3.0 m` (closer in, the geometry becomes unreliable) and is frozen at the last valid value whenever the gate leaves frame.
+
+### Bearing and Yaw Guidance
+
+Bearing to the gate in the body frame:
+```
+bearing_body = atan2(by, bx)     capped at ±25°
+blend        = clip(bx / PERP_BLEND_DIST, 0, 1)
+```
+
+Yaw blends from bearing-tracking (far) to gate-face-normal alignment (close):
+```
+yaw_err = blend × bearing_capped_12 + (1−blend) × gate_tilt_ema
+```
+
+Gate face normal is derived from PnP pose estimation (`cv2.Rodrigues`), with an EMA (`TILT_EMA_ALPHA = 0.25`) reducing the raw ±10° PnP noise to ~±4°.
 
 ---
 
@@ -283,14 +400,24 @@ rb_z = −rc_z·sin(20°) + rc_y·cos(20°)
 | Body (FRD) | X = Forward, Y = Right, Z = Down. Co-origin with world at arm point. |
 | Camera | Origin at body frame. Tilted 20° upward (nose-up) from body X axis. |
 
-All MAVLink messages use NED. `SET_ATTITUDE_TARGET` quaternions are ZYX Euler convention: positive pitch = nose up, positive roll = right side down, positive yaw = clockwise from above.
+All MAVLink messages use NED. `SET_ATTITUDE_TARGET` sends a quaternion with typemask `0b00000111`; the simulator decodes this back to Euler angles and applies them directly as body rates in rad/s. There is no native attitude hold mode in the simulator — the outer attitude P loop in the controller provides this explicitly.
+
+**Critical sign conventions** (confirmed empirically against simulator ground truth):
+
+- Gyro signs are inverted vs NED: `gx = -imu['xgyro']` etc.
+- Simulator pitch speed reports with opposite sign to `thetadot`: `q_e = -q_raw` in sysid.
+- Tilt compensation: `tilt_factor = 1 - 2*(qx² + qy²)` (exact simulator formula).
+- Thrust mapping is quadratic: `a_T = 139.7 × cmd_thrust²`.
 
 ---
 
 ## Known Simulator Behaviours
 
+- **Rate interface only.** `SET_ATTITUDE_TARGET` quaternion values are decoded back to Euler angles and applied directly as body rates in rad/s. The sim has no native attitude hold mode.
+- **Quadratic thrust mapping.** `a_T = 139.7 × cmd_thrust²`. Using a linear model underestimates thrust authority by ~2×.
 - **Stale UDP packets** from previous sessions remain in the OS buffer after a restart. The controller guards against these by recording the sim clock at the moment it enters `WAIT_FOR_START` and rejecting any `race_start_boot_time_ms` that predates this anchor.
 - **Ground contact collisions** fire hundreds of times per second while the drone is on the pad before takeoff. The collision logger throttles output to one summary line per second.
+- **Hover trim** is exactly `cmd_thrust = 0.265` at level attitude.
 
 ---
 
@@ -299,17 +426,20 @@ All MAVLink messages use NED. `SET_ATTITUDE_TARGET` quaternions are ZYX Euler co
 **Hangs at "Waiting for heartbeat..."**
 The simulator is not running, or Windows Firewall is blocking UDP 14550. Add inbound UDP rules for ports 14550 and 5600.
 
-**"Armed and data ready" never prints**
-The drone is arming but no `ODOMETRY` message is arriving. Check that the sim is in a state where telemetry is streaming (not paused or in menu).
+**"Armed and IMU ready" never prints**
+The drone is arming but no `HIGHRES_IMU` message is arriving. Check that the sim is in a state where telemetry is streaming (not paused or in menu).
 
-**Drone climbs uncontrollably**
-`thrust_trim` is too high. Decrease in increments of 0.01 until the drone hovers level at the target altitude.
+**Drone climbs or sinks steadily**
+`HOVER_THRUST` is off. The correct value is `0.264`–`0.265`. Adjust in increments of `0.001`. Note that altitude is controlled via gate elevation error (`_last_elev_err`) not IMU-integrated altitude — IMU dead-reckoning drifts over multi-second timescales and cannot be used as an absolute altitude reference.
 
-**Drone sinks after takeoff**
-`thrust_trim` is too low. Increase in increments of 0.01.
+**Drone rolls or yaws unexpectedly at launch**
+The `LAUNCH_PITCH_DEG` seed for `GyroAHRS` may be incorrect for the current launch-ramp geometry. Adjust to match the actual ramp angle.
+
+**D terms saturating (T=0.000 or extreme roll commands)**
+Check the vision pipeline for detection jumps between gates. `BEARING_RATE_CLAMP_DEG_S` and `ELEV_RATE_CLAMP_M_S` should prevent these from reaching the actuators. If still occurring, reduce `K_LAT_D` or `K_D_thrust`.
+
+**Gate bearing oscillates close in**
+The blend ramp (`PERP_BLEND_DIST`) may be too wide, keeping roll authority active too close to the gate. Reduce from 6.0 m. Alternatively, the PnP gate-normal EMA (`TILT_EMA_ALPHA`) may need reducing if tilt estimates are noisy at close range.
 
 **Early-start disqualification**
 The `WAIT_FOR_START` phase should prevent this. If it still occurs, check the `[WAIT] go=True` log line — it should only appear after `race_start_boot_time_ms` has become positive and greater than the anchor.
-
-**Vision gate estimate is jittery**
-Adjust the HSV thresholds in `vision_rx.py` (`LOWER_RED_1/2`, `UPPER_RED_1/2`) to better match the gate colour under the sim's lighting. Increasing `MIN_CONTOUR_AREA` filters out smaller false-positive detections.
