@@ -1,6 +1,7 @@
 import time
 import math
 import threading
+from collections import deque
 import numpy as np
 import cv2
 from enum import Enum, auto
@@ -25,6 +26,55 @@ LAUNCH_PITCH_DEG = -17.8    # NED: negative = nose down
 G = 9.81   # m/s²
 
 THRUST_ACCEL_COEFF = 9.81 / HOVER_THRUST**2   # m/s² per thrust^2
+
+# -----------------------------------------------------------------------
+# Accelerometer spike filter  (METHOD B — SMA)
+# -----------------------------------------------------------------------
+# Sliding-window simple moving average applied to raw body-frame
+# accelerometer readings before rotation to NED and velocity integration.
+#
+# At 120 Hz IMU rate, each sample = ~8.3 ms:
+#   ACC_SMOOTH_N = 3  →  ~25 ms window, ~8 ms group delay   (light, low lag)
+#   ACC_SMOOTH_N = 5  →  ~42 ms window, ~17 ms group delay  (default)
+#   ACC_SMOOTH_N = 7  →  ~58 ms window, ~25 ms group delay  (heavy, blurs manoeuvres)
+#
+# Set ACC_SMOOTH_N = 1 to pass raw values with no smoothing at all.
+# See _integrate_kinematics for METHOD A (thrust-based physical cap).
+ACC_SMOOTH_N = 5
+
+# -----------------------------------------------------------------------
+# Vision velocity fusion
+# -----------------------------------------------------------------------
+# VIS_VEL_EMA_ALPHA : EMA weight on each new raw optical-flow velocity sample,
+#   applied per-axis (vY, vZ) before blending with the IMU estimate.
+#   At 30 Hz camera rate, alpha=0.35 → ~55 ms time constant (~1.7 frames).
+#   Lower = smoother but slower to react to real velocity changes.
+VIS_VEL_EMA_ALPHA = 0.35
+
+# OF_ALPHA : IMU weight in the IMU / vision-velocity blend  (0–1).
+#   (1 − OF_ALPHA) is the weight given to the EMA-smoothed vision velocity.
+#   0.6/0.4 gives stronger drift correction than the original 0.7/0.3 split,
+#   while still weighting IMU for short-term dynamics.
+OF_ALPHA = 0.6
+
+# D term clamps — vision finite-difference rates.
+# Prevent single bad detections from producing triple-digit D signals.
+# At bx=10m, 60 deg/s bearing rate → D_lateral ≈ 10.5 m/s → clips to MAX_BANK.
+BEARING_RATE_CLAMP_DEG_S = 60.0
+ELEV_RATE_CLAMP_M_S      = 5.0
+
+# -----------------------------------------------------------------------
+# Altitude target for thrust PID tuning
+# -----------------------------------------------------------------------
+# NED convention: pD is positive-down, so altitudes ABOVE the arm point
+# are NEGATIVE.  Set GOAL_PD to the desired NED-down position.
+#   GOAL_PD = -5.0  →  5 m above the arm point
+#   GOAL_PD =  0.0  →  hover at arm-point altitude (bench test / sanity check)
+#
+# pD is integrated from vD (IMU dead-reckoning) and starts at 0 at arm time.
+# Drift will accumulate over long runs — acceptable for PID tuning.
+# To revert to vision-based elevation, see the thrust section in FLYING.
+GOAL_PD = -5.0   # metres, NED-down (negative = above arm point)
 
 
 # -----------------------------------------------------------------------
@@ -148,6 +198,7 @@ class Controller:
         self._last_acc_norm   = 0.0
         self._last_cmd_thrust = 0.0   # last thrust commanded by the control loop, [0,1]
         self._last_max_net    = 0.0   # last computed acceleration cap, m/s²
+        self._acc_buf         = deque(maxlen=ACC_SMOOTH_N)   # METHOD B: SMA buffer
 
         self._thrust_integral = 0
 
@@ -155,11 +206,11 @@ class Controller:
         self._last_elev_err       = 0.0   # world-frame gate elevation error (m), frozen on loss
         self._last_fused_frame_id = None  # frame_id of last velocity fusion update
         self._gate_tilt_ema       = None  # EMA-smoothed gate face normal angle (deg)
-        # Vision-derived rate state — previous frame values for finite-difference D terms.
-        # These replace IMU vY/vD in roll and thrust D terms, avoiding IMU drift errors.
-        self._last_d_frame_id = None  # frame_id when D terms were last updated from vision
-        self._vY_at_vision    = 0.0   # body lateral velocity snapshotted at last vision D update
-        self._vD_at_vision    = 0.0   # NED down velocity snapshotted at last vision D update
+        self._last_d_frame_id     = None  # frame_id when D terms were last updated from vision
+        self._vY_at_vision        = 0.0   # body lateral velocity at last vision D update
+        self._vD_at_vision        = 0.0   # NED down velocity at last vision D update
+        self._vision_vy_ema       = 0.0   # EMA-smoothed optical-flow lateral velocity (m/s)
+        self._vision_vz_ema       = 0.0   # EMA-smoothed optical-flow vertical velocity (m/s)
 
         self._reset_flight_state()
 
@@ -184,6 +235,7 @@ class Controller:
             self._last_acc_norm   = 0.0
             self._last_cmd_thrust = 0.0
             self._last_max_net    = 0.0
+            self._acc_buf         = deque(maxlen=ACC_SMOOTH_N)   # METHOD B: clear SMA buffer
         self._last_elev_err       = 0.0
         self._last_fused_frame_id = None
         self._gate_tilt_ema       = None
@@ -194,6 +246,8 @@ class Controller:
         self._last_d_frame_id = None
         self._vY_at_vision    = 0.0
         self._vD_at_vision    = 0.0
+        self._vision_vy_ema   = 0.0
+        self._vision_vz_ema   = 0.0
         print('Controller state reset.', flush=True)
 
     # ------------------------------------------------------------------
@@ -318,9 +372,19 @@ class Controller:
             self.rates_body[1] = math.degrees(gy)
             self.rates_body[2] = math.degrees(gz)
 
-            # Velocity integration with physical acceleration cap.
-            # See _integrate_kinematics for the cap derivation and application.
-            ax, ay, az = imu['xacc'], imu['yacc'], imu['zacc']
+            # ── METHOD B: SMA filter on raw body-frame accelerometer ─────────
+            # Accumulate raw samples into a fixed-length deque; pass the mean
+            # to _integrate_kinematics.  Window size = ACC_SMOOTH_N (top of file).
+            # METHOD A (thrust-based physical cap) is commented out inside
+            # _integrate_kinematics — swap by toggling the active block there.
+            ax_raw, ay_raw, az_raw = imu['xacc'], imu['yacc'], imu['zacc']
+            self._acc_buf.append((ax_raw, ay_raw, az_raw))
+            n_buf = len(self._acc_buf)
+            ax = sum(s[0] for s in self._acc_buf) / n_buf
+            ay = sum(s[1] for s in self._acc_buf) / n_buf
+            az = sum(s[2] for s in self._acc_buf) / n_buf
+            # ─────────────────────────────────────────────────────────────────
+
             acc_norm = math.sqrt(ax*ax + ay*ay + az*az)
             self._last_acc_norm = acc_norm
 
@@ -330,19 +394,22 @@ class Controller:
         """
         Strapdown integration — called under _state_lock.
 
-        Applies a hard physical cap to the net linear acceleration, derived
-        from the COMMANDED thrust (self._last_cmd_thrust) rather than the
-        measured accelerometer magnitude:
+        ── METHOD A: thrust-based physical cap (currently DISABLED) ─────────
+        Derives the maximum possible net linear acceleration from the COMMANDED
+        thrust and clips the NED acceleration vector to that bound:
 
             max_accel     = THRUST_ACCEL_COEFF * cmd_thrust²
             max_net_accel = sqrt(max_accel² − G²)     (max_accel ≥ G)
                           = 0                            (max_accel < G)
 
-        Using the commanded value means the cap reflects what the motors are
-        being asked to do, independent of accelerometer noise or transient
-        readings that don't match what was actually commanded.  At
-        cmd_thrust=0 (e.g. before the first control command), max_net=0 and
-        velocity cannot change — correct, since no thrust has been requested.
+        This is physics-motivated: the drone cannot exceed the thrust-derived
+        bound regardless of what the accelerometer says.  Zero lag, no signal
+        distortion when the reading is valid.  See commented block below.
+
+        ── METHOD B: SMA pre-filter (currently ACTIVE) ──────────────────────
+        ax/ay/az arriving here are already the N-sample body-frame average
+        computed in _process_imu.  No further capping is applied.
+        Window size and lag discussion: see ACC_SMOOTH_N at top of file.
         """
         qw, qx, qy, qz = self.ahrs.quaternion
 
@@ -356,17 +423,18 @@ class Controller:
         a_e = sf_e
         a_d = sf_d + G
 
-        # Physical cap derived from commanded thrust.
-        max_accel = THRUST_ACCEL_COEFF * self._last_cmd_thrust * self._last_cmd_thrust
-        max_net   = math.sqrt(max(0.0, max_accel*max_accel - G*G))
-        self._last_max_net = max_net   # exposed for debug display
-
-        a_mag = math.sqrt(a_n*a_n + a_e*a_e + a_d*a_d)
-        if a_mag > max_net and a_mag > 1e-9:
-            scale = max_net / a_mag
-            a_n *= scale
-            a_e *= scale
-            a_d *= scale
+        # ── METHOD A: thrust-based physical cap — DISABLED (METHOD B active) ─
+        # To revert: comment the METHOD B block in _process_imu, uncomment here.
+        # max_accel = THRUST_ACCEL_COEFF * self._last_cmd_thrust * self._last_cmd_thrust
+        # max_net   = math.sqrt(max(0.0, max_accel*max_accel - G*G))
+        # self._last_max_net = max_net
+        # a_mag = math.sqrt(a_n*a_n + a_e*a_e + a_d*a_d)
+        # if a_mag > max_net and a_mag > 1e-9:
+        #     scale = max_net / a_mag
+        #     a_n *= scale
+        #     a_e *= scale
+        #     a_d *= scale
+        # ─────────────────────────────────────────────────────────────────────
 
         self.vel_ned[0] += a_n * dt_imu
         self.vel_ned[1] += a_e * dt_imu
@@ -492,7 +560,6 @@ class Controller:
             vision_vel = self.data.get('vision_velocity')
             vision_valid = False
             bx = by = bz = float('nan')
-            # frame_id needed throughout this block for gating derivative terms
             vis_frame_id = vision.get('frame_id') if vision is not None else None
             if vision is not None:
                 bx = vision.get('body_x_m', float('nan'))
@@ -505,10 +572,8 @@ class Controller:
             # gate_pD: NED-down component of gate position relative to drone.
             #   Positive = gate is below the drone in the world.
             # elev_rate: d(gate_pD)/dt from consecutive vision frames (m/s).
-            #   Positive = gate moving further below (or drone ascending).
             #   Used as D term in thrust — replaces IMU vD which accumulates drift.
-            # Guard bx > MIN_BX_FOR_ELEV: below this range the geometry is
-            # unreliable and could corrupt the frozen hold value.
+            # Guard bx > MIN_BX_FOR_ELEV: below this range geometry is unreliable.
             MIN_BX_FOR_ELEV = 3.0
             elev_rate = 0.0
             if vision_valid and bx > MIN_BX_FOR_ELEV and vis_frame_id is not None:
@@ -528,22 +593,25 @@ class Controller:
                 self._prev_elev_frame_id = None
 
             # ----------------------------------------------------------------
-            # VELOCITY FUSION — blend IMU strapdown with vision-derived velocity.
-            # Vision runs at 30 Hz; the controller runs at 60 Hz; the same
-            # vision_velocity dict therefore sits in self.data for ~2 controller
-            # ticks before a new frame arrives.  We gate on frame_id so each
-            # vision measurement is blended in exactly once, not twice.
-            # Only vY and vZ are corrected; vX (forward) stays IMU-only because
-            # the forward velocity from range-derivative is already well-damped
-            # by the pitch dynamics and less prone to lateral drift.
+            # VELOCITY FUSION — blend IMU strapdown with EMA-smoothed vision velocity.
+            #
+            # EMA pre-filter (VIS_VEL_EMA_ALPHA=0.35) on raw optical-flow per axis
+            # before blending, reducing frame-to-frame noise independently of the
+            # IMU/vision weighting.  Gated on frame_id so each measurement fuses once.
+            # Only vY (lateral) and vZ (body-down) corrected; vX stays IMU-only.
             # ----------------------------------------------------------------
-            OF_ALPHA     = 0.7   # IMU weight; 0.3 goes to vision estimate
-            vel_source   = 'imu'
+            vel_source = 'imu'
             if (vision_vel is not None
                     and vis_frame_id is not None
                     and vis_frame_id != self._last_fused_frame_id):
-                vY = OF_ALPHA * vY + (1.0 - OF_ALPHA) * vision_vel['vy_body_mps']
-                vZ = OF_ALPHA * vZ + (1.0 - OF_ALPHA) * vision_vel['vz_body_mps']
+                vy_raw = vision_vel['vy_body_mps']
+                vz_raw = vision_vel['vz_body_mps']
+                self._vision_vy_ema = (VIS_VEL_EMA_ALPHA * vy_raw
+                                       + (1.0 - VIS_VEL_EMA_ALPHA) * self._vision_vy_ema)
+                self._vision_vz_ema = (VIS_VEL_EMA_ALPHA * vz_raw
+                                       + (1.0 - VIS_VEL_EMA_ALPHA) * self._vision_vz_ema)
+                vY = OF_ALPHA * vY + (1.0 - OF_ALPHA) * self._vision_vy_ema
+                vZ = OF_ALPHA * vZ + (1.0 - OF_ALPHA) * self._vision_vz_ema
                 self._last_fused_frame_id = vis_frame_id
                 vel_source = 'fused'
 
@@ -571,17 +639,15 @@ class Controller:
             yaw_mode      = 'no-vision'
 
             if vision_valid:
-                # Bearing angle to gate. Wider cap (±25°) than before — this
-                # drives roll, not yaw, so larger corrections are appropriate.
+                # Bearing angle to gate. Wider cap (±25°) — drives roll, not yaw.
                 bearing_body = float(np.clip(
                     math.degrees(math.atan2(by, bx)), -25.0, 25.0))
 
                 blend = float(np.clip(bx / PERP_BLEND_DIST, 0.0, 1.0))
 
-                # Bearing rate: d(bearing_body)/dt from consecutive vision frames.
-                # Used as D term for roll — replaces IMU vY which accumulates drift.
-                # Positive = heading error growing (gate drifting further off-axis).
-                # Negative = heading error closing (drone turning toward gate).
+                # Bearing rate: finite difference across consecutive vision frames.
+                # Used as D term for roll.  Natural low-pass: only runs when
+                # frames arrive within 3-frame gap (100 ms at 30 Hz).
                 bearing_rate = 0.0
                 if (vis_frame_id is not None
                         and self._prev_bearing_frame_id is not None
@@ -592,10 +658,9 @@ class Controller:
                     self._prev_bearing_body     = bearing_body
                     self._prev_bearing_frame_id = vis_frame_id
 
-                # ── Gate face normal (PnP rvec → body frame) ──────────────
-                # EMA smoothing reduces the raw ±10° measurement noise to ~±4°
-                # before it feeds the yaw command. EMA resets whenever PnP
-                # drops out so stale values from a different gate don't persist.
+                # Gate face normal (PnP rvec → body frame).
+                # EMA smoothing (alpha=0.25) reduces raw ±10° noise to ~±4°.
+                # EMA resets on PnP dropout so stale values don't persist.
                 pnp_ok = vision.get('pnp_ok') and vision.get('pnp_rvec') is not None
                 if pnp_ok:
                     rvec  = np.array(vision['pnp_rvec'], dtype=np.float64)
@@ -618,10 +683,8 @@ class Controller:
                 else:
                     self._gate_tilt_ema = None
 
-                # ── Yaw: track gate bearing far out, blend to gate normal close in ──
-                # Keeps the gate in frame throughout the approach.
-                # bearing_body is already capped at ±25° for roll; apply a
-                # tighter ±12° cap for yaw to limit body yaw rate.
+                # Yaw: track gate bearing far out, blend to gate normal close in.
+                # Tighter ±12° cap on yaw to limit body yaw rate.
                 yaw_bearing = float(np.clip(bearing_body, -12.0, 12.0))
                 if not math.isnan(gate_tilt_deg):
                     yaw_err  = blend * yaw_bearing + (1.0 - blend) * gate_tilt_deg
@@ -637,62 +700,51 @@ class Controller:
 
 
             # ----------------------------------------------------------------
-            # UNIFIED D TERMS  (lateral and vertical)
+            # D TERMS  (lateral and vertical)
             #
             # D_lateral  (m/s, body-right positive):
-            #   Damping signal for roll.  Positive = moving right.
-            #   desired_roll = p_lat - K_LAT_D * D_lateral
-            #   → reduces right bank when moving right (brakes overshoot).
+            #   New vision frame: clamped bearing_rate → lateral velocity proxy.
+            #   Between frames: fused vY increment since last vision snapshot.
+            #   Vision lost: 0.0, IMU reference reset.
             #
             # D_vertical  (m/s, NED-down positive):
-            #   Damping signal for thrust.  Positive = moving down.
-            #   thrust += K_D * D_vertical
-            #   → adds thrust when descending (brakes descent overshoot).
-            #   → reduces thrust when climbing (brakes climb overshoot).
+            #   New vision frame: clamped -elev_rate.
+            #   Between frames: fused vD increment since last vision snapshot.
+            #   Vision lost: 0.0, IMU reference reset.
             #
-            # On a new vision frame: derived from the position derivative
-            #   (bearing_rate → lateral velocity; elev_rate → vertical velocity).
-            #   IMU velocity reference is snapshotted so between-frame integration
-            #   always starts from zero.
-            #
-            # Between frames (ONLY): IMU velocity increment since the last
-            #   vision frame.  Integration window is ~16–33 ms so drift is
-            #   negligible; this keeps D active at every 60 Hz controller tick.
-            #
-            # Vision lost: reference is reset so delta starts fresh from 0.
+            # Clamps on vision finite differences prevent single bad detections
+            # from producing triple-digit D signals (seen at 100+ deg/s * 28m).
             # ----------------------------------------------------------------
             is_new_d_frame = (vision_valid
                               and vis_frame_id is not None
                               and vis_frame_id != self._last_d_frame_id)
 
             if is_new_d_frame:
-                # Convert bearing_rate (deg/s) → lateral velocity (m/s):
-                # bearing ≈ atan(by/bx), so d(bearing)/dt ≈ -vy_body / bx (rad/s)
-                # → vy_body ≈ -bearing_rate_rad * bx
-                bearing_rate_rad = math.radians(bearing_rate)
-                D_lateral  = -bearing_rate_rad * max(bx, 0.5)   # m/s, cap bx to avoid ÷0
+                bearing_rate_clamped = float(np.clip(
+                    bearing_rate, -BEARING_RATE_CLAMP_DEG_S, BEARING_RATE_CLAMP_DEG_S))
+                D_lateral  = -math.radians(bearing_rate_clamped) * max(bx, 0.5)
 
-                # elev_rate = d(gate_pD)/dt = -vD_drone  (gate moves relatively
-                # lower when drone climbs).  D_vertical = vD_drone = -elev_rate.
-                D_vertical = -elev_rate   # m/s, NED-down positive
+                elev_rate_clamped = float(np.clip(
+                    elev_rate, -ELEV_RATE_CLAMP_M_S, ELEV_RATE_CLAMP_M_S))
+                D_vertical = -elev_rate_clamped
 
-                # Snapshot IMU velocities so between-frame delta starts at 0
-                self._vY_at_vision  = vY
-                self._vD_at_vision  = vD
+                # Snapshot fused velocity so between-frame delta starts at zero
+                self._vY_at_vision    = vY
+                self._vD_at_vision    = vD
                 self._last_d_frame_id = vis_frame_id
 
             elif not vision_valid:
-                # Vision lost — reset reference to current IMU so delta stays small
                 D_lateral  = 0.0
                 D_vertical = 0.0
-                self._vY_at_vision  = vY
-                self._vD_at_vision  = vD
+                self._vY_at_vision    = vY
+                self._vD_at_vision    = vD
                 self._last_d_frame_id = None
 
             else:
-                # Between vision frames: IMU-integrated increment since last frame
-                D_lateral  = vY - self._vY_at_vision   # m/s
-                D_vertical = vD - self._vD_at_vision   # m/s, NED-down positive
+                # Between vision frames: fused-velocity increment since last frame.
+                # Window is ~33 ms so IMU drift contribution is small.
+                D_lateral  = vY - self._vY_at_vision
+                D_vertical = vD - self._vD_at_vision
 
             # ----------------------------------------------------------------
             # ATTITUDE COMMANDS
@@ -724,6 +776,11 @@ class Controller:
             # ----------------------------------------------------------------
             K_P_thrust = 0.014
             K_D_thrust = 0.0175
+
+            # elev_err: vision-derived gate elevation error (frozen on loss).
+            # Positive = gate is below drone → reduce thrust to descend toward it.
+            # GOAL_PD / elev_err_imu retained below for reference; not active.
+            # elev_err_imu = GOAL_PD - pD   # IMU-only fallback (re-enable if vision lost)
 
             tiltFactor = max(0.01, math.cos(math.radians(roll_deg))
                                  * math.cos(math.radians(pitch_deg)))
