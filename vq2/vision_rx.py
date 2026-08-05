@@ -17,14 +17,14 @@ from . import gate_detector as gd
 
 CAMERA_FPS = 30.0
 
-# Passthrough suppression. Contour area is ~746000/range^2, so 80000 px means
-# ~3.1 m, where the gate is 288 px across in a 360 px frame. Cooldown ~0.33 s.
+# area ~746000/range^2, so 80000 px ~= 3.1 m. cooldown ~0.33 s
 PASS_AREA_PX = 80000
 PASS_COOLDOWN_FRAMES = 10
 
 PNP_EMA_ALPHA = 0.4    # jitter suppression on the PnP translation
+TRACK_MAX_MISSES = 8   # frames the gate can be absent before the lock is dropped
 
-# Diagnostics feeding the offline tooling in analysis/. No effect on flight.
+# feeds the offline tooling in analysis/, no flight effect
 INSTRUMENT = True
 DUMP_DIR = 'vision_dump'
 DUMP_EVERY_N = 15
@@ -44,6 +44,9 @@ class VisionRX(CameraRX):
         self._prev_body_pos = None # previous body-frame gate position
         self._in_gate = False
         self._cooldown = 0
+        self._track_hint = None    # (cx, cy, area) of the gate we are following
+        self._track_peak = 0.0     # largest area this track has reached
+        self._track_misses = 0     # consecutive frames the tracked gate was absent
 
         self._log = None
         self._frames_seen = 0
@@ -53,11 +56,13 @@ class VisionRX(CameraRX):
 
         super().__init__(data)     # starts the receive thread — must be last
 
-    # ------------------------------------------------------------- perception
+    # perception
 
     def process_frame(self, frame_id, img):
         """Detect, smooth, and publish. Returns the published estimate or None."""
-        estimate, mask, contours = gd.detect_gate(img)
+        estimate, mask, contours = gd.detect_gate(
+            img, track_hint=self._track_hint, track_peak=self._track_peak)
+        self._update_track(estimate)
 
         if INSTRUMENT:
             self._log_frame(frame_id, img, mask, contours)
@@ -78,11 +83,25 @@ class VisionRX(CameraRX):
         self.data['vision_gate_estimate'] = estimate
         return estimate
 
+    def _update_track(self, estimate):
+        """Carry the gate lock to the next frame, or drop it after enough misses."""
+        if estimate is None:
+            self._track_misses += 1
+            if self._track_misses > TRACK_MAX_MISSES:
+                self._clear_track()
+            return
+        self._track_misses = 0
+        self._track_hint = (estimate['cx'], estimate['cy'], estimate['area'])
+        self._track_peak = max(self._track_peak, estimate['area'])
+
+    def _clear_track(self):
+        self._track_hint = None
+        self._track_peak = 0.0
+        self._track_misses = 0
+
     def _suppress_passthrough(self, estimate):
-        """
-        Blank the estimate while crossing a gate; True means stop here. On exit
-        the cooldown and EMA reset make the next gate acquire from scratch.
-        """
+        """Blank the estimate while crossing a gate; True means stop here. On exit the
+        cooldown and EMA reset make the next gate acquire from scratch."""
         area = estimate['area'] if estimate is not None else 0
 
         if area > PASS_AREA_PX:
@@ -95,6 +114,7 @@ class VisionRX(CameraRX):
             self._cooldown = PASS_COOLDOWN_FRAMES
             self._bbox_ema = None
             self._pnp_ema = None
+            self._clear_track()      # the next gate is a new target, not this one
 
         if self._cooldown > 0:
             self._cooldown -= 1
@@ -109,11 +129,8 @@ class VisionRX(CameraRX):
         self.data['vision_velocity'] = None
 
     def _smooth_pnp(self, estimate):
-        """
-        Smooth the PnP translation, keeping the raw value: velocity is
-        differenced from the unsmoothed pose, or the EMA attenuates the signal
-        being measured.
-        """
+        """EMA the PnP translation but keep the raw value — velocity differences
+        the unsmoothed pose, or the filter attenuates what it is measuring."""
         if estimate is None or not estimate.get('pnp_ok'):
             self._pnp_ema = None
             return
@@ -125,10 +142,8 @@ class VisionRX(CameraRX):
         self._pnp_ema = estimate['pnp_tvec'].copy()
 
     def _publish_velocity(self, estimate):
-        """
-        The gate is stationary, so the drone's velocity is the negated rate of
-        change of the gate's body-relative position.
-        """
+        """Gate is stationary, so drone velocity is the negated rate of change of
+        its body-relative position."""
         if estimate is None:
             self._prev_body_pos = None
             self.data['vision_velocity'] = None
@@ -156,13 +171,11 @@ class VisionRX(CameraRX):
                                             'vz_body_mps': round(vz, 2)}
         self._prev_body_pos = position
 
-    # ------------------------------------------------------------ diagnostics
+    # diagnostics
 
     def _clear_dump_dir(self):
-        """
-        Frame IDs restart at zero each run, so leftover frames would bind to
-        the wrong run's pose in vision_log.csv and corrupt offline scoring.
-        """
+        """Frame IDs restart each run, so leftovers would bind to the wrong run's
+        pose in vision_log.csv and corrupt offline scoring."""
         if not os.path.isdir(DUMP_DIR):
             return
         for name in os.listdir(DUMP_DIR):
@@ -173,13 +186,9 @@ class VisionRX(CameraRX):
                     pass
 
     def _log_frame(self, frame_id, img, mask, contours):
-        """
-        One row of detection diagnostics, plus a raw frame every N.
-
-        The pose columns are what make offline scoring possible, and only
-        populate on a VQ1 flight — VQ2 is what blocks odometry. See
-        `analysis/collect_ground_truth.py`.
-        """
+        """One row of detection diagnostics, plus a raw frame every N. The pose
+        columns are what make offline scoring possible and only populate on a VQ1
+        flight, since VQ2 is what blocks odometry."""
         try:
             self._frames_seen += 1
             best = self._largest_contour_stats(contours, mask)
@@ -203,10 +212,8 @@ class VisionRX(CameraRX):
 
     @staticmethod
     def _largest_contour_stats(contours, mask):
-        """
-        Shape metrics for the largest contour. `fill` is the red fraction of
-        the bbox: low for a hollow gate, high for a solid blob.
-        """
+        """Shape metrics for the largest contour. `fill` is the red fraction of the
+        bbox: low for a hollow gate, high for a solid blob."""
         stats = []
         for contour in contours:
             area = cv2.contourArea(contour)

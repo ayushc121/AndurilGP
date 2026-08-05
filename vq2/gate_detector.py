@@ -11,9 +11,7 @@ import math
 import cv2
 import numpy as np
 
-# --------------------------------------------------------------------------
 # Camera model (spec §3.8) — 640x360, no distortion, pitched 20 deg up
-# --------------------------------------------------------------------------
 
 IMG_W, IMG_H = 640, 360
 CX, CY = 320.0, 180.0
@@ -24,9 +22,7 @@ _CAM_K = np.array([[FX, 0, CX], [0, FY, CY], [0, 0, 1.0]], dtype=np.float32)
 _CAM_DIST = np.zeros((4, 1), dtype=np.float32)
 _HAS_IPPE = hasattr(cv2, 'SOLVEPNP_IPPE_SQUARE')
 
-# --------------------------------------------------------------------------
 # Gate geometry (spec §3.7) — object frame is gate-centred, X right, Y up
-# --------------------------------------------------------------------------
 
 GATE_WIDTH_M = 2.7          # outer frame, used for the pinhole range fallback
 _OUTER_HALF = GATE_WIDTH_M / 2.0
@@ -42,9 +38,7 @@ _OBJ_8PT = np.vstack([_OBJ_OUTER, _square(_INNER_HALF)])
 
 PNP_MAX_REPROJ_PX = 12.0    # reject solves worse than this RMS reprojection error
 
-# --------------------------------------------------------------------------
 # Detection thresholds
-# --------------------------------------------------------------------------
 
 # Gates are the only red objects in the scene. Red straddles the hue wrap in
 # OpenCV's 0-180 scale, so it takes two ranges.
@@ -57,16 +51,19 @@ MIN_CONTOUR_AREA = 300      # below this a detection is a hint, not a pose sourc
 EDGE_MARGIN_PX = 4          # bbox this close to a border counts as clipped
 CENTER_REJECT_FRAC = 0.25   # and this far off-centre makes the clip disqualifying
 
-# Bbox smoothing, reset hard on discontinuity — otherwise passing one gate and
-# acquiring the next blends them into a phantom gate in between.
+# reset hard on discontinuity, or two gates blend into a phantom between them
 EMA_ALPHA = 0.5
 EMA_RESET_DCX = 120         # px of centre jump that means "different gate"
 EMA_RESET_WR = 1.6          # or this ratio of bbox-width change
 
+# largest-contour-per-frame lets a distant gate steal the lock, so once we're
+# tracking one we prefer the contour consistent with last frame
+TRACK_REACQUIRE_AREA_RATIO = 3.0    # break the lock on something this much bigger
+TRACK_PEAK_MIN_FRAC = 0.30          # else the size test walks downhill onto a blob
+TRACK_MATCH_MIN_RADIUS_PX = 50.0    # keeps far gates trackable
 
-# --------------------------------------------------------------------------
+
 # Corner extraction and PnP
-# --------------------------------------------------------------------------
 
 def _order_quad(pts):
     """Sort four points into [TL, TR, BR, BL] by coordinate sums and differences."""
@@ -88,13 +85,10 @@ def _approx_quad(contour, epsilons=(0.03, 0.05, 0.08, 0.12)):
 
 
 def extract_corners(img, contour):
-    """
-    Sub-pixel outer and inner gate corners, [TL, TR, BR, BL]; either may be
-    None. A border-touching contour is rejected — its hull is missing corners.
-
-    The inner opening needs its own mask: the detection mask's morphology
-    fills it at range, where it is only ~16 px across.
-    """
+    """Sub-pixel outer and inner gate corners, [TL, TR, BR, BL]; either may be
+    None. A border-touching contour is rejected, its hull is missing corners.
+    The inner opening needs its own mask — the detection mask's morphology
+    fills it at range, where it is only ~16 px across."""
     gx, gy, gw, gh = cv2.boundingRect(contour)
     if gx <= 1 or gy <= 1 or (gx + gw) >= IMG_W - 2 or (gy + gh) >= IMG_H - 2:
         return None, None
@@ -153,13 +147,10 @@ def _find_inner_quad(img, gray, outer_contour, outer_box, criteria):
 
 
 def solve_pose(corners):
-    """
-    Pose from four outer corners: (tvec, rvec, reproj_err) in the camera frame
-    (x right, y down, z forward), or (None, None, inf).
-
-    IPPE_SQUARE returns two solutions for a planar square; the one behind the
-    camera is discarded and the lower reprojection error wins.
-    """
+    """Pose from four outer corners: (tvec, rvec, reproj_err) in camera frame
+    (x right, y down, z forward), or (None, None, inf). IPPE_SQUARE returns two
+    solutions for a planar square; drop the one behind the camera, take the
+    lower reprojection error."""
     try:
         if _HAS_IPPE:
             n, rvecs, tvecs, errors = cv2.solvePnPGeneric(
@@ -206,19 +197,47 @@ def _reproj_error(obj_pts, rvec, tvec, image_pts):
         proj.reshape(-1, 2) - image_pts.reshape(-1, 2), axis=1)))
 
 
-# --------------------------------------------------------------------------
 # Detection
-# --------------------------------------------------------------------------
 
-def detect_gate(img):
-    """
-    Find the gate in one BGR frame. Returns (estimate, mask, contours), with
-    `estimate` None when nothing usable is present.
+def _select_contour(candidates, track_hint, track_peak):
+    """Choose which red contour is the gate we are flying at."""
+    if track_hint is None:
+        return max(candidates, key=cv2.contourArea)
 
-    `reliable` separates "clean enough to derive a pose from" from "real, but
-    only good enough to steer toward" — the case on descending sections, where
-    the next gate sits below the tilted camera as a clipped band.
-    """
+    prev_cx, prev_cy, prev_area = track_hint
+
+    # much larger contour = much nearer gate. only thing that breaks a lock
+    biggest = max(candidates, key=cv2.contourArea)
+    if cv2.contourArea(biggest) > TRACK_REACQUIRE_AREA_RATIO * max(prev_area, 1.0):
+        return biggest
+
+    # a real gate barely moves at 30 Hz; a far-lock sits elsewhere
+    radius = max(TRACK_MATCH_MIN_RADIUS_PX, 2.0 * math.sqrt(max(prev_area, 1.0)))
+    matches = []
+    for contour in candidates:
+        moments = cv2.moments(contour)
+        if moments['m00'] == 0.0:
+            continue
+        cx = moments['m10'] / moments['m00']
+        cy = moments['m01'] / moments['m00']
+        area = cv2.contourArea(contour)
+        if math.hypot(cx - prev_cx, cy - prev_cy) > radius:
+            continue
+        if not 0.3 < area / prev_area < 3.5:
+            continue
+        if track_peak and area < TRACK_PEAK_MIN_FRAC * track_peak:
+            continue
+        matches.append((math.hypot(cx - prev_cx, cy - prev_cy), contour))
+
+    if not matches:
+        return None                     # hold: the tracked gate is absent this frame
+    return min(matches, key=lambda m: m[0])[1]
+
+
+def detect_gate(img, track_hint=None, track_peak=0.0):
+    """Gate in one BGR frame -> (estimate, mask, contours). `estimate` is None
+    when nothing usable is there, and `reliable` marks the ones clean enough
+    to solve a pose from rather than just steer at."""
     hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
     mask = cv2.bitwise_or(cv2.inRange(hsv, LOWER_RED_1, UPPER_RED_1),
                           cv2.inRange(hsv, LOWER_RED_2, UPPER_RED_2))
@@ -234,7 +253,10 @@ def detect_gate(img):
     if not candidates:
         return None, mask, contours
 
-    best = max(candidates, key=cv2.contourArea)
+    best = _select_contour(candidates, track_hint, track_peak)
+    if best is None:
+        return None, mask, contours
+
     moments = cv2.moments(best)
     if moments['m00'] == 0.0:
         return None, mask, contours
@@ -244,17 +266,15 @@ def detect_gate(img):
     bx, by, bw, bh = cv2.boundingRect(best)
     area = cv2.contourArea(best)
 
-    # Bbox centre, not centroid: the gate is hollow, so the centroid drifts
-    # toward whichever side is thicker in view.
+    # bbox centre not centroid — gate is hollow, centroid drifts to the thick side
     box_cx, box_cy = bx + bw / 2.0, by + bh / 2.0
     clipped_lr = bx <= EDGE_MARGIN_PX or bx + bw >= IMG_W - EDGE_MARGIN_PX
     clipped_tb = by <= EDGE_MARGIN_PX or by + bh >= IMG_H - EDGE_MARGIN_PX
     off_centre_x = abs(box_cx - CX) > CENTER_REJECT_FRAC * IMG_W
     off_centre_y = abs(box_cy - CY) > CENTER_REJECT_FRAC * IMG_H
 
-    # Passing through a gate leaves a sliver against one edge whose width
-    # implies a wildly wrong range. A gate legitimately filling the frame also
-    # touches edges but stays centred, so rejection needs both conditions.
+    # passing through leaves a sliver at one edge — wildly wrong range.
+    # a close gate also touches edges but stays centred, so need both
     if clipped_lr and off_centre_x:
         return None, mask, contours
 
@@ -292,15 +312,11 @@ def _attach_pose(estimate, img, contour):
     estimate.update(pnp_ok=True, pnp_tvec=tvec, pnp_rvec=rvec)
 
 
-# --------------------------------------------------------------------------
 # Pose conversion and smoothing
-# --------------------------------------------------------------------------
 
 def body_relative_pose(estimate):
-    """
-    Add body_x_m (forward), body_y_m (right), body_z_m (down) in place — the
-    entire interface the controller steers on, and why it needs no telemetry.
-    """
+    """Adds body_x_m/y/z in place. This is the whole interface the controller
+    steers on, and the reason it needs no telemetry."""
     if estimate is None:
         return None
 
@@ -327,11 +343,9 @@ def body_relative_pose(estimate):
 
 
 def ema_smooth(prev_bbox, estimate, alpha=EMA_ALPHA):
-    """
-    Smooth the bbox across frames -> (smoothed_estimate, new_prev_bbox).
-    Stateless so live and replay smooth identically. Resets on a gap or a
-    discontinuity in centre or width.
-    """
+    """Smooth the bbox across frames -> (smoothed_estimate, new_prev_bbox).
+    Stateless, so live and replay smooth identically. Resets on a gap or a
+    discontinuity in centre or width."""
     if estimate is None:
         return None, None
 
