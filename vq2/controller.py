@@ -548,7 +548,8 @@ class Controller:
                   flush=True)
 
         # Old PID controller discarded in favor of newly available attitude target function for more stability.
-        self._send_attitude_target(roll_target , -DESIRED_PITCH_DEG, yaw_target, thrust)
+        # The sim's positive-roll convention is opposite to the NED sense
+        self._send_attitude_target(-roll_target , DESIRED_PITCH_DEG, yaw_target, thrust)
 
     # ---------------------------------------------------------------- mavlink
 
