@@ -10,7 +10,7 @@ What remains is a 640×360 camera at 30 Hz and a 120 Hz IMU. Everything the
 controller knows about where it is, how fast it is going, and where the gates
 are has to be derived from those two streams.
 
-That splits into two problems, and they went differently.
+That splits into perception, state estimation and guidance.
 
 ## Perception — works, and is measured
 
@@ -65,43 +65,91 @@ and points at something shared — the object-frame origin, the fixed gate
 elevation offset, or a camera extrinsic. It was never tracked down, and it is
 the single highest-value unresolved bug here.
 
-## State estimation — adequate, structurally incomplete
+## State estimation — a gate-relative filter
 
 `GyroAHRS` integrates attitude from the gyro alone, seeded at the known −17.8°
 launch-block pitch. There is deliberately no accelerometer correction: a
 complementary filter pulls attitude toward the apparent gravity vector, but
 under thrust that vector is gravity *plus* linear acceleration, which describes
-essentially all of a race. The correction would be wrong exactly when it
-mattered most.
+essentially all of a race.
 
-Velocity comes from strapdown integration of accelerometer specific force,
-rotated to NED through the attitude estimate, on a dedicated 400 Hz thread so
-no 120 Hz IMU sample is dropped. Vision corrects the lateral and vertical
-channels by differencing gate position between frames; forward velocity stays
-on the IMU, because the gate's apparent growth rate is a far weaker range
-signal than its lateral motion is a bearing signal.
+Velocity and position come from `estimator.py`, a six-state filter over
+`[position, velocity]` expressed **relative to the gate currently anchored**.
+The IMU predicts at 400 Hz; each PnP detection is a position measurement that
+corrects it. Working gate-relative means no map is needed, which is the whole
+point — VQ2 does not give you one.
 
-The structural gap: position is integrated but never corrected by anything. It
-drifts without bound. That was survivable only because the controller never
-uses absolute position — it steers entirely on relative geometry. A proper
-visual-inertial filter with vision as a measurement update is the right answer
-and was scoped but not built.
+Three details carry most of the value:
+
+**The acceleration cap bounds thrust, not total acceleration.** Capping `|a|`
+goes to zero at and below hover, which forbids acceleration exactly while the
+drone is falling: a real free fall got scaled to nothing and the vertical
+velocity estimate inverted its sign on 91% of moving ticks. Bounding the
+thrust-produced part instead took that to 4%.
+
+**Measurement noise is anisotropic and grows with range.** PnP is tight in the
+image plane and weak along the optical axis, so `R` is built diagonal in the
+camera frame and rotated into NED, with the range term scaling as range². The
+coefficient was fitted to 1259 ground-truth samples, not guessed.
+
+**Handoff re-anchors on the first valid fix, not on two that agree.** Judging
+agreement against the filter's own drifted prediction is circular, and once
+produced permanent blindness — the filter rejected every fix with the gate in
+plain view. Garbage is caught instead by state-independent range and aspect
+filters, so a bad anchor is a transient rather than a lockout. Re-anchoring
+keeps velocity and its covariance, since world velocity does not care which
+gate you are measuring against.
+
+**Measured on a VQ1 flight** with the telemetry controller flying and the
+estimator running blind beside it (`python -m analysis.ekf_accuracy`):
+
+| | median | vs baseline |
+|---|---|---|
+| position error | 1.04 m | **6.5× better** than raw strapdown (6.74 m) |
+| velocity error | 1.50 m/s | **2.8× better** than raw CV (4.23 m/s) |
+
+That is on the anchor-active rows, which is the honest filter — scoring against
+whichever gate happens to be nearest flatters the result, and the tool prints
+both and says so.
 
 ## Layout
 
 ```
-gate_detector.py   detection, corner extraction, PnP, pose conversion — pure
+gate_detector.py   detection, tracking, corner extraction, PnP — pure functions
 vision_rx.py       temporal state and diagnostics on top of core.camera_rx
-controller.py      estimation thread, guidance, attitude commands
+gate_ekf.py        six-state [position, velocity] filter, pure numpy
+estimator.py       gate-relative VIO: IMU predicts, PnP corrects
+controller.py      guidance and attitude commands
 ```
 
 Offline tooling and the accuracy data live in [`analysis/`](../analysis).
 
+## Guidance
+
+Roll steers, banking on the gate's bearing with damping on lateral closure,
+faded out by a blend factor as the gate plane approaches so the drone is not
+still turning as it crosses. Thrust is PD on measured gate elevation,
+tilt-compensated.
+
+Yaw is a rate-limited nulling integrator: each new camera frame moves the
+commanded heading a step toward the bearing, and with no gate in view the
+setpoint is held rather than steered. The bearing comes from the raw camera ray,
+not from the AHRS — routing it through estimated attitude closes a loop on the
+filter's own error. The step is gated on frame ID, since one 30 Hz frame spans
+two 60 Hz ticks and a relative step would otherwise apply twice.
+
+Yaw being an absolute setpoint also makes the pad heading a real constant. It
+was 90° out on VQ2, so the aircraft snapped to that false heading the instant
+thrust came up. Fixing it dropped peak yaw rate in the first half-second from
+over 200 °/s to about 2, and gate detection went from roughly a quarter of
+frames to about two thirds. It was the single largest measured improvement in
+the project.
+
 ## Known issues
 
 The −1.12 m vertical bias, above.
-Gate selection is "largest red contour". With several gates in frame this picks
-the nearest, which is usually but not always the active one. A tracker that
-maintains identity across frames would be more robust, and the detection
-overlays in the root README show a frame where the heuristic is visibly
-debatable.
+
+Gate selection starts from the largest red contour. The tracker keeps that
+choice stable once made, but acquisition can still latch the wrong gate when
+several are in frame — the detection overlays in the root README show one where
+the heuristic is visibly debatable.

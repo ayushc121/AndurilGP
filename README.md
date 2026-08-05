@@ -46,15 +46,25 @@ Measured perception accuracy, from 934 frames diffed against true odometry:
 
 Reproduce with `python -m analysis.accuracy`.
 
+State estimation is a six-state gate-relative filter — IMU predicts at 400 Hz,
+PnP detections correct it — measured against real odometry on a VQ1 flight:
+
+| | median | vs baseline |
+|---|---|---|
+| position error | 1.04 m | **6.5×** better than raw strapdown |
+| velocity error | 1.50 m/s | **2.8×** better than raw CV |
+
+Reproduce with `python -m analysis.ekf_accuracy`.
+
 ## Layout
 
 ```
 core/       MAVLink transport, camera transport, telemetry decode, clock sync
 vq1/        telemetry-guided controller + the first gate detector
-vq2/        vision-only controller + the evolved detector with pose solving
+vq2/        vision-only controller, tracking detector, gate-relative VIO
 analysis/   offline accuracy scoring and detector replay, with sample data
 sysid/      system identification: thrust map and attitude dynamics
-tests/      63 tests, no simulator required
+tests/      90 tests, no simulator required
 ```
 
 ## Running
@@ -93,10 +103,9 @@ its own detector. The controller reads that state at a fixed rate and writes
 attitude setpoints back.
 
 Both qualifiers run four background threads — heartbeat, telemetry, clock sync
-and the camera — with the control loop on the main thread. VQ2 adds a fifth: a
-400 Hz estimation thread that catches every 120 Hz IMU sample, maintaining
-attitude by gyro integration and velocity by strapdown dead-reckoning. It is
-deliberately decoupled from the 60 Hz control loop, since tying state
+and the camera — with the control loop on the main thread. VQ2 adds two more: a
+400 Hz strapdown thread inside the controller, and the gate-relative estimator.
+Both are deliberately decoupled from the 60 Hz control loop, since tying state
 estimation to the command rate throws away three quarters of the IMU data.
 
 Both entry points run until interrupted. The sim disarms and re-arms between
@@ -133,10 +142,13 @@ Everything below is aimed at VQ2 lap time. That round is scored on the fastest
 completed run, so speed is what the remaining work is for.
 
 **Path planning.** The controller steers gate to gate with no representation of
-the route it intends to fly, which caps how fast it can safely go. Adding a
-planning layer where we map the course across attempts and flying a fitted
-trajectory through it, rather than reacting to one gate at a time, is what makes
-a faster line possible, and is required for any time-optimal method.
+the route it intends to fly, which caps how fast it can safely go. A planning
+layer — mapping the course across attempts and flying a fitted trajectory
+through it, rather than reacting to one gate at a time — is what makes a faster
+line possible, and is required for any time-optimal method. A first attempt at
+this used a rapid motion primitive and failed in flight on a frame mismatch
+between the commanded and estimated yaw; the geometry was right and the wiring
+was not.
 
 **Learned control.** A policy trained directly against lap time is the more
 ambitious version of the same goal, but it needs far more flight hours than
