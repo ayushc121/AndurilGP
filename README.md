@@ -19,6 +19,7 @@ was built: the detector back-projects a gate position every tick and telemetry
 overrides it, so vision flew the full course live on every run without being
 able to cost one.
 
+Video:
 [![VQ1 full-course run](https://img.youtube.com/vi/HfdJw55CZkQ/maxresdefault.jpg)](https://youtu.be/HfdJw55CZkQ)
 
 **Virtual Qualifier 2 — completed the full course.** VQ2 blocks
