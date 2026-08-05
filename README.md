@@ -19,9 +19,7 @@ was built: the detector back-projects a gate position every tick and telemetry
 overrides it, so vision flew the full course live on every run without being
 able to cost one.
 
-<!-- Replace the line below with the run video.
-     Drop the file in docs/ and use:  https://github.com/<user>/<repo>/assets/... -->
-📹 **[VQ1 full-course run — video to be attached]**
+[![VQ1 full-course run](https://img.youtube.com/vi/HfdJw55CZkQ/maxresdefault.jpg)](https://youtu.be/HfdJw55CZkQ)
 
 **Virtual Qualifier 2 — vision-only, best result 3 gates.** VQ2 blocks
 `ODOMETRY`, `ATTITUDE` and gate positions. The drone has a camera and an IMU

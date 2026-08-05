@@ -70,7 +70,7 @@ VISION_ELEV_OFFSET_M  = 1.0    # empirical bias correction on the back-projectio
 # Thrust — altitude PD
 # --------------------------------------------------------------------------
 
-HOVER_THRUST    = 0.265   # measured hover trim (see sysid/)
+HOVER_THRUST    = 0.264   # measured hover trim (see sysid/)
 K_ALT_P         = 0.05    # thrust per metre of altitude error
 K_ALT_D         = 0.08    # thrust per m/s of vertical speed
 MIN_TILT_FACTOR = 0.01    # guards the divide when the drone is near-vertical
