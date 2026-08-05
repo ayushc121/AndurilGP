@@ -18,10 +18,8 @@ HEARTBEAT_HZ = 5   # spec requires >= 2 Hz; 5 leaves margin
 
 
 class HeartbeatSender:
-    """
-    Emits a MAVLink HEARTBEAT. Not optional — the sim rejects commands from a
-    client it has not heard from recently.
-    """
+    """Emits a MAVLink HEARTBEAT. Not optional — the sim ignores a client it
+    has not heard from recently."""
 
     def __init__(self, mavlink_conn):
         self.mavlink_conn = mavlink_conn
@@ -43,10 +41,8 @@ class HeartbeatSender:
 
 def setup_components(shared_data, system_boot_ms, server_ip, server_port,
                      controller_cls, vision_cls=None):
-    """
-    Build every component and start its thread. The shared lock goes into
-    `shared_data` first, since every component takes its lock from there.
-    """
+    """Build every component and start its thread. The shared lock goes into
+    `shared_data` first — everything else takes its lock from there."""
     shared_data['lock'] = threading.Lock()
 
     sim_conn = mavutil.mavlink_connection(f'udpin:{server_ip}:{server_port}')
@@ -67,13 +63,7 @@ def setup_components(shared_data, system_boot_ms, server_ip, server_port,
 
 
 def run(components):
-    """
-    Arm and fly until interrupted, then shut every thread down.
-
-    No self-terminating condition: the sim re-arms between runs and the
-    controller handles that in place, so Ctrl-C is the way out. The threads
-    are non-daemon, so skipping the shutdown hangs the interpreter on exit.
-    """
+    """Arm and fly until interrupted, then shut every thread down."""
     controller = components['controller']
 
     print('Arming drone...', flush=True)
@@ -92,7 +82,7 @@ def run(components):
 def shutdown(components):
     """Signal each background thread to stop and wait for it."""
     print('Shutting down background threads...', flush=True)
-    for name in ('heartbeat', 'ts_loop', 'mavlink_rx', 'vision_rx'):
+    for name in ('heartbeat', 'ts_loop', 'mavlink_rx', 'vision_rx', 'vio'):
         component = components.get(name)
         if component is not None:
             component.get_thread_for_join().join(timeout=2.0)
