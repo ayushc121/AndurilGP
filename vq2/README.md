@@ -10,7 +10,7 @@ What remains is a 640×360 camera at 30 Hz and a 120 Hz IMU. Everything the
 controller knows about where it is, how fast it is going, and where the gates
 are has to be derived from those two streams.
 
-That splits into three problems, and they went differently.
+That splits into two problems, and they went differently.
 
 ## Perception — works, and is measured
 
