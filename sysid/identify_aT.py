@@ -1,27 +1,20 @@
 """
-identify_aT.py
+Fits the heave model to vertical step-thrust runs.
 
-Identifies C, Zw, Zww jointly from vertical step-thrust CSV.
+    wdot = g - C·T_actual² + Zw·w_b + Zww·w_b·|w_b|
 
-Model: wdot = g  -  C·T_actual²  +  Zw·w_b  +  Zww·w_b·|w_b|
+C is pinned from hover equilibrium and Zw/Zww come from OLS pooled over every
+step window. The design matrix condition number gets printed — above ~1e4 the
+two damping terms are not separated and the fallback values are the safer call.
 
-Three-parameter OLS pooled across all step windows.
-Condition number of the design matrix is reported — if > 1e4, the
-parameters are not well-separated and the sysid fallback values should
-be used for Zw/Zww instead.
-
-NED: w_b positive downward, g = +9.81.
-At hover: C = g / T_hover² ≈ 9.81 / 0.265² ≈ 139.7 m/s²
-B-matrix heave entry at trim T0: -2·C·T0
+NED throughout, so w_b is positive downward and g is +9.81.
 """
 
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# =============================================================================
 # CONFIG
-# =============================================================================
 CSV_PATH     = "thrust/thrust_max.csv"   # relative to sysid/; change per run
 HOVER_THRUST = 0.265
 
@@ -37,7 +30,6 @@ COND_WARN    = 1e4
 
 STEP_THRESH = 0.03   # minimum cmd_thrust jump to count as a new step
 HOVER_TOL   = 0.02   # steps within this of HOVER_THRUST are settle periods — skip
-# =============================================================================
 
 G = 9.81
 
@@ -58,9 +50,7 @@ def reconstruct_T_actual(t, cmd, tau_m):
     return T
 
 
-# ---------------------------------------------------------------------------
 # Load
-# ---------------------------------------------------------------------------
 df  = pd.read_csv(CSV_PATH)
 t   = df["t_s"].to_numpy()
 w_b = df["w_b"].to_numpy()
@@ -71,9 +61,7 @@ print(f"Loaded {len(t)} samples  |  dt={dt_med*1000:.2f} ms  |  dur={t[-1]:.1f} 
 
 wdot = np.gradient(w_b, t)
 
-# ---------------------------------------------------------------------------
 # Detect step onsets
-# ---------------------------------------------------------------------------
 dcmd = np.diff(cmd)
 step_indices = [0]
 for i in range(1, len(dcmd)):
@@ -82,9 +70,7 @@ for i in range(1, len(dcmd)):
 step_indices.append(len(t))
 print(f"Detected {len(step_indices)-1} thrust levels\n")
 
-# ---------------------------------------------------------------------------
 # Collect data from all step windows
-# ---------------------------------------------------------------------------
 segments = []   # list of (T_actual, w_b_seg, wdot_seg, T_cmd) per step
 
 for k in range(len(step_indices) - 1):
@@ -111,24 +97,13 @@ for k in range(len(step_indices) - 1):
 if not segments:
     raise RuntimeError("No valid step levels found.")
 
-# ---------------------------------------------------------------------------
-# C is exact from hover equilibrium — no fitting needed.
-# At hover: wdot=0, w_b=0  →  0 = g - C·T_hover²  →  C = g/T_hover²
-# Fitting C from flight data is ill-conditioned because T_actual and w_b
-# always rise together — there's no window where thrust varies while
-# velocity stays zero.
-# ---------------------------------------------------------------------------
+# C falls out of hover equilibrium: wdot=0, w_b=0 gives C = g/T_hover². fitting
+# it from flight data is ill-conditioned, thrust and velocity always rise together
 C_fixed  = G / HOVER_THRUST**2
 print(f"C fixed from hover equilibrium: g / T_hover² = {C_fixed:.4f} m/s²\n")
 
-# ---------------------------------------------------------------------------
-# 2-parameter OLS with C fixed:  wdot - g + C·T_actual² = Zw·w_b + Zww·w_b·|w_b|
-# Zw and Zww separate well: Zw dominates at low velocity, Zww at high velocity.
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
-# 2-parameter OLS with C fixed:  wdot - g + C·T_actual² = Zw·w_b + Zww·w_b·|w_b|
-# Zw and Zww separate well: Zw dominates at low velocity, Zww at high velocity.
-# ---------------------------------------------------------------------------
+# 2-param OLS with C fixed. Zw dominates at low speed, Zww at high, so they
+# separate cleanly:  wdot - g + C·T² = Zw·w_b + Zww·w_b·|w_b|
 Y_all   = np.concatenate([s["wdot"] - G + C_fixed*s["T_actual"]**2 for s in segments])
 Zw_col  = np.concatenate([s["w_b"]                                  for s in segments])
 Zww_col = np.concatenate([s["w_b"] * np.abs(s["w_b"])              for s in segments])
@@ -170,9 +145,7 @@ print(f"  {'-'*63}")
 print(f"  B-matrix heave at hover: -2·C·T_hover = {-2*C_fixed*HOVER_THRUST:.4f} m/s²")
 print(f"{'='*65}\n")
 
-# ---------------------------------------------------------------------------
 # Plots
-# ---------------------------------------------------------------------------
 fig, axes = plt.subplots(1, 3, figsize=(14, 5))
 fig.suptitle(f"C/Zw/Zww identification  |  {CSV_PATH}", fontsize=10)
 

@@ -19,9 +19,7 @@ import cv2
 import numpy as np
 from pymavlink import mavutil
 
-# --------------------------------------------------------------------------
 # Loop timing
-# --------------------------------------------------------------------------
 
 CONTROL_HZ         = 60    # command rate: 2:1 with the 30 Hz camera
 ESTIMATION_POLL_HZ = 400   # oversamples the 120 Hz IMU so no sample is missed
@@ -31,54 +29,35 @@ DEBUG_EVERY_N      = 20
 ARM_RETRY_S      = 1.0
 POST_DISARM_WAIT = 0.25
 
-# --------------------------------------------------------------------------
-# Platform constants
-# --------------------------------------------------------------------------
-
 G                = 9.81
-HOVER_THRUST     = 0.265   # measured hover trim (see sysid/)
-LAUNCH_PITCH_DEG = -17.8   # the drone starts on an angled launch block
-
-# Heading of the launch pad. Yaw is an absolute setpoint, so a wrong value here
-# snaps the nose the moment thrust comes up — the "release kick" was this
-# constant sitting 90 deg out.
-LAUNCH_YAW_CMD_DEG = 90.0
-
-# Thrust-to-acceleration constant, from the hover equilibrium in sysid/.
+HOVER_THRUST     = 0.265   # measured, see sysid/
+LAUNCH_PITCH_DEG = -17.8   # pad is angled
 THRUST_ACCEL_COEFF = G / HOVER_THRUST ** 2
 
-# Moving average over the accelerometer: ~42 ms window at 120 Hz. Kills the
-# contact and motor spikes that would otherwise integrate into velocity error.
-ACC_SMOOTH_N = 5
+# pad heading. yaw is an absolute setpoint so a wrong value here snaps the
+# nose the moment thrust comes up — this was the "release kick", 90 deg out
+LAUNCH_YAW_CMD_DEG = 90.0
 
-# --------------------------------------------------------------------------
-# Vision / IMU velocity fusion
-# --------------------------------------------------------------------------
+ACC_SMOOTH_N = 5           # ~42 ms at 120 Hz, kills contact/motor spikes
 
-VIS_VEL_EMA_ALPHA = 0.35   # smoothing on raw vision velocity, applied first
-OF_ALPHA          = 0.60   # IMU's share of the blend; vision gets the rest
+VIS_VEL_EMA_ALPHA = 0.35   # smooth vision velocity first
+OF_ALPHA          = 0.60   # IMU share of the blend
 
-# Bound the damage one bad detection can do to a finite difference.
+# one bad detection makes a huge finite difference, so cap them
 BEARING_RATE_CLAMP_DEG_S = 60.0
 ELEV_RATE_CLAMP_M_S      = 5.0
 
-# --------------------------------------------------------------------------
-# Guidance gains
-# --------------------------------------------------------------------------
-
-BEARING_CLAMP_DEG = 25.0   # bearing feeding the roll loop
-YAW_CLAMP_DEG     = 12.0   # tighter: yaw authority is limited on purpose
+BEARING_CLAMP_DEG = 25.0   # feeds the roll loop
+YAW_CLAMP_DEG     = 12.0   # tighter on purpose
 YAW_RATE_LIMIT_DEG_S = 45.0
 
-# +1 was flown and gave positive feedback — the nose ran away from the gate.
-YAW_BEARING_SIGN = -1.0
-PERP_BLEND_DIST_M = 6.0    # inside this range, yaw shifts from bearing to normal
-TILT_EMA_ALPHA    = 0.25   # PnP gate-normal is ~±10 deg noisy; this gets it to ~±4
-MIN_RANGE_FOR_ELEV_M = 3.0 # below this the gate fills the frame; geometry is junk
+YAW_BEARING_SIGN = -1.0    # +1 was flown, gave positive feedback. don't flip
+PERP_BLEND_DIST_M = 6.0    # inside this, yaw shifts bearing -> normal
+TILT_EMA_ALPHA    = 0.25   # raw normal is ~±10 deg noisy
+MIN_RANGE_FOR_ELEV_M = 3.0 # closer than this the gate fills the frame
 
-# How long the last elevation error may be held after the gate is lost. Held
-# forever it is a permanent climb or descent with nothing to end it: one run
-# rode a stale +4.32 m error into the ground.
+# hold the last elevation error this long after losing the gate. unbounded,
+# a stale error is a permanent climb/descent — one run rode +4.32 m into the ground
 ELEV_HOLD_MAX_S = 1.5
 
 DESIRED_PITCH_DEG = -3.0   # constant nose-down: the only source of forward speed
@@ -89,13 +68,10 @@ MAX_BANK_DEG      = 25.0
 K_P_THRUST = 0.014         # thrust per metre of gate elevation error
 K_D_THRUST = 0.0175        # thrust per m/s of vertical closure
 
-# The sim's roll axis runs opposite to NED; pitch agrees.
-ROLL_CMD_SIGN = -1.0
+ROLL_CMD_SIGN = -1.0       # sim roll axis is opposite to NED
 
 
-# --------------------------------------------------------------------------
 # Attitude estimation
-# --------------------------------------------------------------------------
 
 def quat_to_R_wb(q):
     """Body-to-world (NED) rotation matrix from a [w, x, y, z] quaternion."""
@@ -108,15 +84,7 @@ def quat_to_R_wb(q):
 
 
 def body_accel_to_ned(quat, ax, ay, az, cmd_thrust):
-    """
-    Gravity-removed NED acceleration from one accelerometer sample, with the
-    thrust-produced component bounded by what the commanded thrust can make.
-
-    Capping the total instead goes to zero at and below hover, which forbids
-    acceleration exactly while the drone is falling: a real free fall scaled to
-    nothing and inverted the sign of the vertical velocity estimate on 91% of
-    moving ticks. Bounding the thrust part took that to 4%.
-    """
+    """Gravity-removed, thrust-capped NED acceleration from one accelerometer sample."""
     qw, qx, qy, qz = quat
     sf_n = (1 - 2 * (qy * qy + qz * qz)) * ax + 2 * (qx * qy - qw * qz) * ay + 2 * (qx * qz + qw * qy) * az
     sf_e = 2 * (qx * qy + qw * qz) * ax + (1 - 2 * (qx * qx + qz * qz)) * ay + 2 * (qy * qz - qw * qx) * az
@@ -124,6 +92,8 @@ def body_accel_to_ned(quat, ax, ay, az, cmd_thrust):
 
     max_accel = THRUST_ACCEL_COEFF * cmd_thrust * cmd_thrust
 
+    # cap the thrust part, not the total — capping |a| goes to zero at hover
+    # and forbids acceleration while falling. inverted vD on 91% of ticks
     thrust_part = np.array([sf_n, sf_e, sf_d])
     magnitude = float(np.linalg.norm(thrust_part))
     saturated = magnitude > max_accel
@@ -145,13 +115,9 @@ def euler_to_quat(roll, pitch, yaw):
 
 
 class GyroAHRS:
-    """
-    Attitude from gyro integration alone, seeded at the known launch pitch.
-
+    """Attitude from gyro integration alone, seeded at the known launch pitch.
     No accelerometer correction on purpose: under thrust the apparent gravity
-    vector is gravity plus linear acceleration, so a complementary filter would
-    be wrong for most of a race.
-    """
+    vector is gravity plus linear acceleration, which is most of a race."""
 
     def __init__(self, initial_pitch_deg=0.0):
         self.q = np.array(euler_to_quat(0.0, math.radians(initial_pitch_deg), 0.0))
@@ -204,16 +170,12 @@ class GateView:
         self.blend = 0.0
 
 
-# --------------------------------------------------------------------------
 # Controller
-# --------------------------------------------------------------------------
 
 class Controller:
-    """
-    Vision-only flight controller. An estimation thread integrates IMU at
-    400 Hz; the 60 Hz control loop snapshots that state and turns the latest
-    detection into an attitude setpoint.
-    """
+    """Vision-only flight controller. A 400 Hz estimation thread integrates the
+    IMU; the 60 Hz control loop snapshots it and turns the latest detection into
+    an attitude setpoint."""
 
     def __init__(self, sim_conn, data, system_boot_ms):
         self.sim_conn = sim_conn
@@ -274,12 +236,12 @@ class Controller:
         self._vd_at_vision = 0.0
         print('Controller state reset.', flush=True)
 
-    # ---------------------------------------------------------------- public
+    # public
 
     def arm(self):
         self._send_arm()
 
-    # ------------------------------------------------------------ estimation
+    # estimation
 
     def _start_estimation_thread(self):
         if self._est_thread is not None and self._est_thread.is_alive():
@@ -323,12 +285,9 @@ class Controller:
             self._integrate_kinematics(acc, dt)
 
     def _integrate_kinematics(self, acc, dt):
-        """
-        Strapdown integration: specific force -> NED velocity -> position.
-
-        Caller holds _state_lock. Position has no correction term and drifts
-        without bound; only velocity is corrected, and only by vision.
-        """
+        """Strapdown integration: specific force -> NED velocity -> position. Caller
+        holds _state_lock. Position drifts without bound; only velocity is
+        corrected, and only by vision."""
         qw, qx, qy, qz = self.ahrs.quaternion
         a_ned, _, saturated = body_accel_to_ned(
             self.ahrs.quaternion, acc[0], acc[1], acc[2], self._last_cmd_thrust)
@@ -342,7 +301,7 @@ class Controller:
         self.vel_body[1] = 2 * (qx * qy - qw * qz) * vn + (1 - 2 * (qx * qx + qz * qz)) * ve + 2 * (qy * qz + qw * qx) * vd
         self.vel_body[2] = 2 * (qx * qz + qw * qy) * vn + 2 * (qy * qz - qw * qx) * ve + (1 - 2 * (qx * qx + qy * qy)) * vd
 
-    # --------------------------------------------------------------- control
+    # control
 
     def update(self):
         """One control tick. Dispatches on flight phase, then sleeps."""
@@ -411,12 +370,7 @@ class Controller:
             self._send_attitude_target(0.0, 0.0, 0.0, 0.0)
 
     def _wait_for_start(self, race_status):
-        """
-        Hold on the pad at zero thrust until the countdown elapses.
-
-        `race_start_boot_time_ms` persists across runs, so it is only trusted
-        once it is at or after the clock reading taken when this phase began.
-        """
+        """Hold on the pad at zero thrust until the countdown elapses."""
         self._send_attitude_target(0.0, 0.0, 0.0, 0.0)
         if race_status is None:
             return
@@ -431,7 +385,7 @@ class Controller:
             print('Countdown complete — flying.', flush=True)
             self.phase = Phase.FLYING
 
-    # -------------------------------------------------------------- guidance
+    # guidance
 
     def _observe_gate(self, vision, quat):
         """Turn the latest detection into body-frame gate geometry."""
@@ -459,8 +413,7 @@ class Controller:
         view.bearing_rate = self._frame_rate(
             view.bearing_deg, view.frame_id, '_prev_bearing', '_prev_bearing_frame')
 
-        # Rotate the gate vector out through attitude, so a banked drone
-        # doesn't read its own tilt as altitude error.
+        # rotate out through attitude so a bank isn't read as altitude error
         if view.fwd > MIN_RANGE_FOR_ELEV_M:
             qw, qx, qy, qz = quat
             elev = (2 * (qx * qz - qw * qy) * view.fwd
@@ -470,16 +423,14 @@ class Controller:
                 elev, view.frame_id, '_prev_elev', '_prev_elev_frame')
             self._elev_err = elev
             self._elev_err_at = time.monotonic()
-        # Closer than that, the gate fills the frame: hold the last value.
+        # closer than that the gate fills the frame — hold the last value
 
         view.tilt_deg = self._gate_tilt(vision)
         return view
 
     def _frame_rate(self, value, frame_id, value_attr, frame_attr):
-        """
-        Finite difference per second, over gaps of 1-3 frames only. A wider gap
-        means the gate was lost and re-acquired, so the difference is noise.
-        """
+        """Finite difference per second, over gaps of 1-3 frames. A wider gap means
+        the gate was lost and re-acquired, so the difference is noise."""
         prev_v = getattr(self, value_attr)
         prev_f = getattr(self, frame_attr)
         rate = 0.0
@@ -491,10 +442,8 @@ class Controller:
         return rate
 
     def _gate_tilt(self, vision):
-        """
-        Gate face normal in the body frame, used to square up on approach.
-        EMA because raw PnP normals are ~±10 deg noisy; resets on dropout.
-        """
+        """Gate face normal in the body frame. EMA'd, because raw PnP normals are
+        ~±10 deg noisy, and reset on dropout."""
         if not (vision.get('pnp_ok') and vision.get('pnp_rvec') is not None):
             self._tilt_ema = None
             return float('nan')
@@ -515,10 +464,8 @@ class Controller:
         return self._tilt_ema
 
     def _fuse_velocity(self, vision_vel, frame_id, v_right, v_down):
-        """
-        Correct lateral/vertical velocity with vision, once per camera frame.
-        Forward stays on the IMU — apparent gate growth is a weak range signal.
-        """
+        """Correct lateral/vertical velocity with vision, once per camera frame.
+        Forward stays on the IMU — apparent gate growth is a weak range signal."""
         if vision_vel is None or frame_id is None or frame_id == self._last_fused_frame:
             return v_right, v_down, 'imu'
 
@@ -532,10 +479,8 @@ class Controller:
                 'fused')
 
     def _damping_terms(self, view, v_right, v_down_ned):
-        """
-        Closure rates for the D terms: vision on a fresh frame, IMU delta
-        between frames, zero with no gate in view.
-        """
+        """Closure rates for the D terms. Vision on a fresh frame, IMU delta between
+        frames, zero with no gate in view."""
         fresh = view.valid and view.frame_id is not None and view.frame_id != self._last_damping_frame
 
         if fresh:
@@ -558,26 +503,12 @@ class Controller:
             self._last_damping_frame = view.frame_id
         return lateral, vertical, 'vision' if fresh else 'none'
 
-    def _held_elev_err(self):
-        """Elevation error, or zero once the held value is too old to trust."""
-        if self._elev_err_at is None:
-            return 0.0
-        if time.monotonic() - self._elev_err_at > ELEV_HOLD_MAX_S:
-            return 0.0
-        return self._elev_err
-
     def _step_yaw(self, view):
-        """
-        Walk the absolute heading setpoint toward the gate, rate limited.
-
-        The bearing is the raw camera ray, never the AHRS-derived one: routing
-        it through estimated attitude closes a loop on the filter's own error.
-        With no gate in view the setpoint is held, not steered.
-        """
+        """Walk the absolute heading setpoint toward the gate, rate-limited."""
         if not view.valid:
             return self._yaw_cmd
-        # One 30 Hz frame covers two 60 Hz ticks, and the step is relative to
-        # the last command, so consuming it twice slews at double the limit.
+        # one 30 Hz frame covers two 60 Hz ticks, and the step is relative to
+        # the last command, so consuming it twice slews at double the limit
         if view.frame_id is not None and view.frame_id == self._yaw_frame:
             return self._yaw_cmd
         self._yaw_frame = view.frame_id
@@ -588,6 +519,16 @@ class Controller:
         self._yaw_cmd += float(np.clip(correction, -step_limit, step_limit))
         self._yaw_cmd = (self._yaw_cmd + 180.0) % 360.0 - 180.0
         return self._yaw_cmd
+
+    def _held_elev_err(self):
+        """Elevation error, or zero once the held value is too old to trust."""
+        # holding through a short blackout keeps the climb going across a gate;
+        # holding forever is a stale command with nothing to end it
+        if self._elev_err_at is None:
+            return 0.0
+        if time.monotonic() - self._elev_err_at > ELEV_HOLD_MAX_S:
+            return 0.0
+        return self._elev_err
 
     def _fly(self):
         """Run one guidance/control pass and send the resulting setpoint."""
@@ -605,17 +546,16 @@ class Controller:
             vision_vel, view.frame_id, v_right, v_down)
         d_lateral, d_vertical, d_source = self._damping_terms(view, v_right, v_down_ned)
 
-        # Roll steers, damped by lateral closure. `blend` hands authority from
-        # roll to yaw as the gate plane approaches, so the drone stops steering
-        # and starts squaring up on the face normal.
+        # roll steers, damped by lateral closure. blend hands authority to yaw
+        # near the gate plane so we square up instead of still turning
         p_lat = K_BEARING * view.bearing_deg * view.blend
         d_lat = K_LAT_D * d_lateral * view.blend
         roll_target = float(np.clip(p_lat - d_lat, -MAX_BANK_DEG, MAX_BANK_DEG))
 
         yaw_target = self._step_yaw(view)
 
-        # PD on gate elevation, divided by the lift lost to tilt.
-        # Positive elev_err means the gate is below us.
+        # PD on gate elevation, divided by lift lost to tilt.
+        # positive elev_err = gate is below us
         elev_err = self._held_elev_err()
         tilt_loss = max(0.01, math.cos(math.radians(roll_deg)) * math.cos(math.radians(pitch_deg)))
         thrust = (HOVER_THRUST - elev_err * K_P_THRUST
@@ -631,11 +571,11 @@ class Controller:
                   f'cmd=(r={roll_target:+5.1f} y={yaw_target:+5.1f} T={thrust:.3f})',
                   flush=True)
 
-        # Absolute setpoints, not errors — the sim closes its own attitude loop.
+        # absolute setpoints, not errors — the sim closes its own attitude loop
         self._send_attitude_target(ROLL_CMD_SIGN * roll_target,
                                    DESIRED_PITCH_DEG, yaw_target, thrust)
 
-    # ---------------------------------------------------------------- mavlink
+    # mavlink
 
     def _send_attitude_target(self, roll_deg, pitch_deg, yaw_deg, thrust):
         """Type mask 7 = use the quaternion, ignore the body-rate fields."""

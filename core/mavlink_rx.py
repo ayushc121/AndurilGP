@@ -84,7 +84,7 @@ class MAVLinkRX:
             if handler is not None:
                 handler(msg)
 
-    # ---------------------------------------------------------------- handlers
+    # handlers
 
     def on_heartbeat(self, msg):
         with self.lock:
@@ -143,7 +143,7 @@ class MAVLinkRX:
         self._last_collision_print = now
         self._collisions_since_print = 0
 
-    # ------------------------------------------------------- encapsulated data
+    # encapsulated data
 
     def on_encapsulated_data(self, msg):
         payload = bytes(msg.data)

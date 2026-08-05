@@ -27,10 +27,8 @@ CSV_HEADER = [
 
 
 def world_to_body(vn, ve, vd, qw, qx, qy, qz):
-    """
-    NED to body frame (X forward, Y right, Z down) — the same rotation the
-    controller uses, so truth and estimate are expressed identically.
-    """
+    """NED to body. Same rotation the controller uses, so truth and estimate
+    are expressed identically."""
     return (
         (1 - 2 * (qy * qy + qz * qz)) * vn + 2 * (qx * qy + qw * qz) * ve + 2 * (qx * qz - qw * qy) * vd,
         2 * (qx * qy - qw * qz) * vn + (1 - 2 * (qx * qx + qz * qz)) * ve + 2 * (qy * qz + qw * qx) * vd,
@@ -51,10 +49,8 @@ class GroundTruthLogger:
         self._file.close()
 
     def log(self, t, gate_idx, odo, gate_pos, vision, vision_velocity, gate_quat=None):
-        """
-        Record one comparison. Skips when there is no detection, which is the
-        expected state during gate-passthrough blanking.
-        """
+        """One comparison row. Skipped when there is no detection, which is normal
+        during passthrough blanking."""
         if vision is None or gate_pos is None or odo is None:
             return
 

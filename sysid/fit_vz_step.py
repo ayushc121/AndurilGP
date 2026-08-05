@@ -1,7 +1,6 @@
 """
-fit_vz_step.py
-Fits vz(t) = vz_inf * (1 - exp(-t / tau_m)) to a thrust step response.
-Edit the CSV path and STEP_* constants at the top, then run.
+Fits vz(t) = vz_inf * (1 - exp(-t / tau_m)) to one thrust step response.
+Set the CSV path and STEP_* constants below, then run.
 """
 
 import numpy as np
@@ -9,14 +8,11 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.optimize import curve_fit
 
-# =============================================================================
 # CONFIG — edit these per run
-# =============================================================================
 CSV_PATH     = "thrust_4.csv"   # relative to this directory; change per run
 HOVER_THRUST = 0.265
 STEP_SIZE    = 0.4-0.265    # must match what was commanded
 STEP_DURATION = 5.0   # seconds at each level (hover, then step, then back)
-# =============================================================================
 
 def model(t, vz_inf, tau_m):
     return vz_inf * (1.0 - np.exp(-t / tau_m))

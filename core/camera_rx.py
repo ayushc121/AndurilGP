@@ -58,9 +58,8 @@ class CameraRX:
             chunks = partial.setdefault(frame_id, {})
             chunks[chunk_id] = packet[_HEADER_SIZE:]
 
-            # Check for every index rather than trusting the count: frame IDs
-            # restart at zero each run, so a stale partial frame can collide
-            # with a new one and reach the expected total with a hole in it.
+            # check every index, don't trust the count — frame IDs restart
+            # each run, so a stale partial can hit the total with a hole in it
             if len(chunks) >= total and all(i in chunks for i in range(total)):
                 del partial[frame_id]
                 image = cv2.imdecode(
@@ -74,11 +73,8 @@ class CameraRX:
                 del partial[stale]
 
     def _process_frame_guarded(self, frame_id, img):
-        """
-        Nothing supervises this thread. If it dies the controller keeps flying
-        on a stale estimate with no warning, so dropping a frame is the lesser
-        failure.
-        """
+        """Nothing supervises this thread — if it dies the controller flies on a
+        stale estimate, so dropping a frame is the lesser failure."""
         try:
             self.process_frame(frame_id, img)
         except Exception as exc:                      # noqa: BLE001

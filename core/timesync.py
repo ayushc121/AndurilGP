@@ -7,11 +7,8 @@ TIMESYNC_REQUEST_HZ = 10
 
 
 class TimeSync:
-    """
-    Requests TIMESYNC at a fixed rate; `MAVLinkRX.on_timesync` records the
-    offset in `shared_data['clock_offset_ns']`. Neither controller reads that
-    offset today, but the exchange is part of the session the sim expects.
-    """
+    """Requests TIMESYNC; `MAVLinkRX.on_timesync` stores the offset. Nothing
+    reads it yet, but the sim expects the exchange."""
 
     def __init__(self, mavlink_connection):
         self.mavlink_conn = mavlink_connection

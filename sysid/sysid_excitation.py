@@ -1,42 +1,10 @@
 """
-sysid_excitation.py  (v3 — per-regime, per-axis, gain-scheduled)
-=================================================================
-Structured excitation script for regime-specific grey-box sysid.
-Replaces the entire FLYING phase control block for data collection.
+Structured excitation for grey-box system identification.
 
-USAGE
------
-Edit the TEST CONFIGURATION block below, then run your simulator.
-The script handles stabilisation, trim hold, excitation, and recovery
-automatically. One CSV + one JSON metadata file are saved per run.
-
-OUTPUT FILES
-------------
-  sysid_{REGIME_ID}_{EXCITE_AXIS}_{REPETITION}.csv
-  sysid_{REGIME_ID}_{EXCITE_AXIS}_{REPETITION}_meta.json
-
-CSV columns:
-  t, x, y, z,
-  vx_b, vy_b, vz_b,
-  phi, theta, psi,
-  p, q, r,
-  ax_b, ay_b, az_b,
-  cmd_roll, cmd_pitch, cmd_yaw, cmd_thrust,
-  phase_tag, regime_id
-
-phase_tag values:
-  settle      — initial stabilisation from launch ramp
-  hold        — trim condition being held, pre-excitation
-  excitation  — 3211 / doublet active  ← MATLAB uses only this
-  recovery    — returning to hover
-  done        — flight complete
-
-PHASE TIMING  (seconds from start)
------------------------------------
-  0   – SETTLE_DUR      : PID drives to target trim
-  +HOLD_DUR             : PID holds trim, data tagged 'hold'
-  +EXCITE_DUR           : excitation on target axis
-  +RECOVERY_DUR         : PID returns to hover
+Replaces the flight control block for one data-collection run. Set the test
+config below, fly, and it handles settle -> hold -> excite -> recover on its
+own, writing one CSV and one metadata JSON per run. Only the rows tagged
+'excitation' get fitted; the rest are there to prove trim was actually reached.
 """
 
 import math
@@ -45,21 +13,17 @@ import json
 import os
 import numpy as np
 
-# =============================================================================
-# TEST CONFIGURATION — the ONLY section you edit between runs
-# =============================================================================
+# the only block that changes between runs
 REGIME_ID    = 'P1'       # P0 P1 P2 P3 P4 P5  B1 B2 B3  C1 C2 D1
 EXCITE_AXIS  = 'yaw'     # roll | pitch | yaw | heave | drop
 REPETITION   = 1          # increment for repeat runs of the same test
 
-# Target trim angles (degrees).  Use the table in the plan doc.
+# trim targets, degrees. see REGIME_TABLE at the bottom
 THETA0_DEG   =   -20.0      # target pitch  (negative = nose-down / forward)
 PHI0_DEG     =   0.0      # target roll   (positive = right-wing-down)
 
 NOTES        = ''         # optional free-text annotation saved in metadata JSON
-# =============================================================================
 
-# ── Output directory ──────────────────────────────────────────────────────────
 OUT_DIR  = os.path.dirname(os.path.abspath(__file__))
 TAG      = f'sysid_{REGIME_ID}_{EXCITE_AXIS}_{REPETITION}'
 CSV_PATH = os.path.join(OUT_DIR, TAG + '.csv')
@@ -75,23 +39,19 @@ CSV_HEADER = [
     'phase_tag', 'regime_id'
 ]
 
-# ── Odometry / IMU keys ───────────────────────────────────────────────────────
+# odometry / IMU dict keys
 KEY_QW='qw'; KEY_QX='qx'; KEY_QY='qy'; KEY_QZ='qz'
 KEY_X='x'; KEY_Y='y'; KEY_Z='z'
 KEY_VX='vx'; KEY_VY='vy'; KEY_VZ='vz'     # body-frame direct
 KEY_P='rollspeed'; KEY_Q='pitchspeed'; KEY_R='yawspeed'
 KEY_AX='xacc'; KEY_AY='yacc'; KEY_AZ='zacc'
 
-# ── Altitude buffer ───────────────────────────────────────────────────────────
-# During the settle phase the drone climbs to this height above its spawn point
-# before beginning the hold/excitation phases. Gives vertical margin for
-# attitude excursions that temporarily reduce effective vertical thrust.
-# Increase for high-angle regimes (P3-P5) where excursions are larger.
-ALTITUDE_BUFFER_M = 10.0    # metres to climb above spawn Z before proceeding
+# climb this far above spawn during settle, so a big attitude excursion has
+# room to lose vertical thrust without hitting the ground. raise it for P3-P5
+ALTITUDE_BUFFER_M = 10.0
 KP_ALT  = 0.10             # thrust delta per metre of altitude error
 KD_ALT  = 0.05             # thrust delta per (m/s) of vertical body velocity
 
-# ── Timing ────────────────────────────────────────────────────────────────────
 CONTROL_HZ    = 100
 DT            = 1.0 / CONTROL_HZ
 
@@ -102,11 +62,10 @@ RECOVERY_DUR  = 4.0    # s — return to hover before we stop
 
 TOTAL_DUR     = SETTLE_DUR + HOLD_DUR + EXCITE_DUR + RECOVERY_DUR
 
-# ── Convert trim targets to radians ──────────────────────────────────────────
 THETA0 = math.radians(THETA0_DEG)
 PHI0   = math.radians(PHI0_DEG)
 
-# ── PID gains (match your existing tuning) ────────────────────────────────────
+# PID gains, same tuning as the race controller
 # Pitch
 KP_PITCH = 0.015;  KD_PITCH = 0.001
 # Roll
@@ -115,13 +74,10 @@ KP_ROLL  = 0.015;  KD_ROLL  = 0.001025
 KP_YAW   = 0.03;   KD_YAW   = 0.002
 # Altitude / heave — feedback on body-down velocity
 
-# ── 3211 parameters ───────────────────────────────────────────────────────────
 UNIT = 0.35   # seconds — base duration of one 3211 step
               # 7*UNIT = 2.45 s per sequence; fits well in 10 s excitation window
 
-# ── Excitation amplitudes per axis ────────────────────────────────────────────
-# Sized to produce clearly measurable angular rate responses (~10-20 deg/s)
-# without departing too far from trim (keeping the linear assumption valid).
+# big enough to move the rates ~10-20 deg/s, small enough to stay near trim
 AMP = {
     'roll' : 0.12,   # ~14 deg/s peak roll rate
     'pitch': 0.12,   # ~14 deg/s peak pitch rate
@@ -130,18 +86,11 @@ AMP = {
     'drop' : 0.0,    # drop cuts thrust to near-zero — no amplitude needed
 }
 
-# ── Heave doublet timing ──────────────────────────────────────────────────────
 HEAVE_STEP_DUR = 2.0   # seconds per thrust step in doublet
 
 
-# =============================================================================
-# Helper: 3211 signal
-# =============================================================================
 def _3211(t_local):
-    """
-    Returns +1/-1/0 following the 3-2-1-1 pattern scaled by UNIT.
-    Zero outside the 7*UNIT active window.
-    """
+    """+1/-1/0 in the 3-2-1-1 pattern, zero outside the 7*UNIT window."""
     if   t_local < 0:          return  0.0
     elif t_local < 3*UNIT:     return +1.0
     elif t_local < 5*UNIT:     return -1.0
@@ -150,39 +99,29 @@ def _3211(t_local):
     else:                      return  0.0
 
 
-# =============================================================================
-# Helper: tilt-compensated thrust
-# =============================================================================
 THRUST_HOVER = 0.265   # physical hover trim constant — never changes
 
 def _tilt_thrust(qx, qy, w_b=0.0):
-    """
-    Quaternion-exact tilt compensation matching the simulator formula exactly:
-        tilt_factor = 1 - 2*(qx^2 + qy^2)
-    Divides THRUST_HOVER by tilt_factor so the vertical thrust component
-    always equals hover trim regardless of pitch/roll angle.
-    w_b term removed — vertical velocity damping is handled by altitude hold.
-    """
+    """Hover thrust divided by the sim's own tilt factor, so the vertical
+    component stays at trim at any bank or pitch angle."""
+    # w_b unused, vertical damping lives in the altitude hold instead
     tilt = 1.0 - 2.0 * (qx**2 + qy**2)
     tilt = max(tilt, 0.01)
     return THRUST_HOVER / tilt
 
 
-# =============================================================================
-# Main class
-# =============================================================================
 class SysIdSegment:
     """
-    One test segment: settle → hold → excite → recover.
+    One test segment: settle -> hold -> excite -> recover.
 
-    In your flight loop (replace entire PID block):
+    Drop into the flight loop in place of the PID block:
 
-        # ── initialise once ──────────────────────────────────────────
+        # once
         from sysid_excitation import SysIdSegment
         self._seg = SysIdSegment()
         self._seg_start = None
 
-        # ── each tick ────────────────────────────────────────────────
+        # every tick
         if self._seg_start is None:
             self._seg_start = time.time()
         t_el = time.time() - self._seg_start
@@ -216,13 +155,8 @@ class SysIdSegment:
         print(f'[SYSID] Logging → {CSV_PATH}')
         print(f'[SYSID] Total duration: {TOTAL_DUR:.1f} s')
 
-    # ── single control tick ───────────────────────────────────────────────────
     def step(self, odometry, imu, t):
-        """
-        Returns (roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd).
-        Logs one row to CSV.
-        """
-        # ── unpack state ──────────────────────────────────────────────────────
+        """One tick. Logs a CSV row, returns (roll, pitch, yaw, thrust)."""
         qw=odometry[KEY_QW]; qx=odometry[KEY_QX]
         qy=odometry[KEY_QY]; qz=odometry[KEY_QZ]
 
@@ -240,16 +174,13 @@ class SysIdSegment:
         else:
             ax_b=ay_b=az_b=float('nan')
 
-        # Lock yaw target and spawn altitude on first tick
         if self._psi_target is None:
             self._psi_target = psi
             self._spawn_z    = z_pos
-            # In NED, up = negative Z, so target altitude is spawn_z minus buffer
-            self._alt_target = z_pos - ALTITUDE_BUFFER_M
+            self._alt_target = z_pos - ALTITUDE_BUFFER_M   # NED, so minus = higher
             print(f'[SYSID] Yaw target locked: {math.degrees(psi):.1f} deg')
             print(f'[SYSID] Spawn Z={z_pos:.2f}m  Alt target Z={self._alt_target:.2f}m (NED)')
 
-        # ── determine phase ───────────────────────────────────────────────────
         if   t < SETTLE_DUR:
             phase = 'settle'
         elif t < SETTLE_DUR + HOLD_DUR:
@@ -263,12 +194,10 @@ class SysIdSegment:
 
         t_excite = t - (SETTLE_DUR + HOLD_DUR)   # local time within excitation
 
-        # ── compute commands ──────────────────────────────────────────────────
         roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd = \
             self._commands(phase, t_excite, phi, theta, psi,
                            p_r, q_r, r_r, vz_b, qx, qy, z_pos)
 
-        # ── log ───────────────────────────────────────────────────────────────
         self._writer.writerow([
             f'{t:.5f}',
             f'{x_pos:.5f}', f'{y_pos:.5f}', f'{z_pos:.5f}',
@@ -283,60 +212,39 @@ class SysIdSegment:
 
         return roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd
 
-    # ── command computation ───────────────────────────────────────────────────
     def _commands(self, phase, t_ex, phi, theta, psi,
                   p_r, q_r, r_r, w_b, qx, qy, z_pos):
-        """
-        Compute roll/pitch/yaw/thrust commands for current phase.
-
-        Strategy:
-          • ALL phases run PID on every axis.
-          • During 'excitation', the excited axis gets PID_trim + 3211 on top.
-          • During 'settle'/'hold', PID drives to THETA0/PHI0.
-          • During 'recovery', PID drives back to 0/0.
-        """
-
-        # ── pitch target ──────────────────────────────────────────────────────
+        """Commands for the current phase. Every axis runs PID the whole time;
+        excitation just adds the 3211 on top of the excited one."""
         if phase in ('settle', 'hold', 'excitation'):
             theta_target = THETA0
         else:
             theta_target = 0.0   # recovery: return to level
 
-        # ── roll target ───────────────────────────────────────────────────────
         if phase in ('settle', 'hold', 'excitation'):
             phi_target = PHI0
         else:
             phi_target = 0.0
 
-        # ── PID for pitch (drives theta to theta_target) ──────────────────────
         err_pitch       = math.degrees(theta_target - theta)
         pitch_pid       = KP_PITCH * err_pitch - KD_PITCH * math.degrees(q_r)
 
-        # ── PID for roll (drives phi to phi_target) ───────────────────────────
         err_roll        = math.degrees(phi_target - phi)
         roll_pid        = KP_ROLL * err_roll - KD_ROLL * math.degrees(p_r)
 
-        # ── PID for yaw (hold locked heading) ────────────────────────────────
         err_yaw         = math.degrees(self._psi_target - psi)
         err_yaw         = (err_yaw + 180.0) % 360.0 - 180.0
         yaw_pid         = KP_YAW * err_yaw - KD_YAW * math.degrees(r_r)
 
-        # ── Tilt-compensated thrust with altitude hold ───────────────────────────
-        # NED convention: up = more negative Z.
-        # alt_target = spawn_z - ALTITUDE_BUFFER_M  (more negative = higher)
-        # alt_err > 0 means z_pos > alt_target → drone is BELOW target → need MORE thrust
-        # alt_err < 0 means z_pos < alt_target → drone is ABOVE target → need LESS thrust
-        # w_b > 0 means moving DOWN → need MORE thrust to slow descent
-        # _tilt_thrust already handles hover compensation; altitude hold adds correction.
-        tilt_comp = _tilt_thrust(qx, qy, 0.0)   # pure tilt compensation, no w_b term
+        # tilt compensation only, altitude hold adds the correction on top
+        tilt_comp = _tilt_thrust(qx, qy, 0.0)
         if self._alt_target is not None:
-            alt_err          = z_pos - self._alt_target   # >0 = below target in NED
+            alt_err          = z_pos - self._alt_target   # >0 = below target
             alt_thrust_delta = KP_ALT * alt_err + KD_ALT * w_b
             thrust_base      = float(np.clip(tilt_comp + alt_thrust_delta, 0.0, 1.0))
         else:
             thrust_base = tilt_comp
 
-        # ── Excitation overlay ────────────────────────────────────────────────
         excite_roll  = 0.0
         excite_pitch = 0.0
         excite_yaw   = 0.0
@@ -346,8 +254,7 @@ class SysIdSegment:
             amp = AMP[EXCITE_AXIS]
 
             if EXCITE_AXIS == 'roll':
-                # Two back-to-back 3211 sequences with inverted sign
-                # to capture both positive and negative nonlinearity
+                # second sequence inverted, catches sign asymmetry
                 seq1 = _3211(t_ex)
                 seq2 = -_3211(t_ex - 7*UNIT - 0.5)   # 0.5 s gap between seqs
                 excite_roll = amp * (seq1 + seq2)
@@ -368,27 +275,17 @@ class SysIdSegment:
                 excite_thrust_delta = amp if (idx % 2 == 0) else -amp
 
             elif EXCITE_AXIS == 'drop':
-                # Near-zero thrust free-fall excitation.
-                # Commands T=0.02 (minimum) for the full excitation window so
-                # the drone enters free fall and reaches high downward velocity.
-                # The altitude hold baseline is completely overridden here.
-                # Recovery phase PID will bring it back up.
-                excite_thrust_delta = 0.0   # handled by override below
+                excite_thrust_delta = 0.0   # free fall, see override below
 
-        # ── Assemble final commands ───────────────────────────────────────────
         roll_cmd   = roll_pid  + excite_roll
         pitch_cmd  = pitch_pid + excite_pitch
         yaw_cmd    = yaw_pid   + excite_yaw
         thrust_cmd = thrust_base + excite_thrust_delta
 
-        # ── Drop axis thrust override ─────────────────────────────────────────
-        # During drop excitation we bypass tilt-compensated hover thrust
-        # entirely and command minimum thrust to achieve free fall.
-        # Attitude PIDs still run to keep the drone level during the drop.
+        # drop bypasses the hover baseline entirely. attitude PIDs keep flying
         if EXCITE_AXIS == 'drop' and phase == 'excitation':
             thrust_cmd = 0.02   # near-zero, not exactly 0 to keep motors armed
 
-        # ── Safety clips ─────────────────────────────────────────────────────
         roll_cmd   = float(np.clip(roll_cmd,  -0.6,  0.6))
         pitch_cmd  = float(np.clip(pitch_cmd, -0.6,  0.6))
         yaw_cmd    = float(np.clip(yaw_cmd,   -0.4,  0.4))
@@ -397,7 +294,6 @@ class SysIdSegment:
         return roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd
 
     def close(self):
-        """Flush CSV and write metadata JSON."""
         self._csv_file.flush()
         self._csv_file.close()
         print(f'[SYSID] Data saved → {CSV_PATH}')
@@ -423,29 +319,22 @@ class SysIdSegment:
         print(f'[SYSID] Metadata saved → {META_PATH}')
 
 
-# =============================================================================
-# Regime reference table  (printed at import for quick reference)
-# =============================================================================
+# T0 values are rough starting points, the tilt compensation adapts from there.
+# B and C regimes need a run at +phi0 and another at -phi0.
 REGIME_TABLE = """
-╔══════════╦═══════════╦════════════╦══════════════════════════════════════╗
-║ RegimeID ║  theta0   ║   phi0     ║  T0_nominal   Notes                  ║
-╠══════════╬═══════════╬════════════╬══════════════════════════════════════╣
-║ P0       ║   0 deg   ║   0 deg    ║  0.265        Hover baseline         ║
-║ P1       ║ -20 deg   ║   0 deg    ║  0.28         Mild forward flight    ║
-║ P2       ║ -40 deg   ║   0 deg    ║  0.35         Moderate forward       ║
-║ P3       ║ -60 deg   ║   0 deg    ║  0.50         Aggressive forward     ║
-║ P4       ║ -75 deg   ║   0 deg    ║  0.75         Near-max speed         ║
-║ P5       ║ -85 deg   ║   0 deg    ║  0.95         Max speed / near-inv.  ║
-║ B1       ║ -30 deg   ║  ±30 deg   ║  0.32         Moderate banked turn   ║
-║ B2       ║ -45 deg   ║  ±45 deg   ║  0.45         Aggressive bank        ║
-║ B3       ║ -60 deg   ║  ±50 deg   ║  0.65         Max bank racing turn   ║
-║ C1       ║ -40 deg   ║  ±30 deg   ║  0.38         Combined validation    ║
-║ C2       ║ -60 deg   ║  ±50 deg   ║  0.70         Extreme combined val.  ║
-║ D1       ║   0 deg   ║   0 deg    ║  0.02         Free-fall drop test    ║
-╚══════════╩═══════════╩════════════╩══════════════════════════════════════╝
-Axes:  roll | pitch | yaw | heave | drop
-Note:  For B1/B2/B3, run once with +phi0 and once with -phi0 (separate reps)
-       T0_nominal values are estimates; the tilt-compensation PID will adapt.
+  id    theta0    phi0     T0     what it covers
+  P0      0        0      0.265   hover baseline
+  P1    -20        0      0.28    mild forward flight
+  P2    -40        0      0.35    moderate forward
+  P3    -60        0      0.50    aggressive forward
+  P4    -75        0      0.75    near-max speed
+  P5    -85        0      0.95    max speed, near inverted
+  B1    -30      +/-30    0.32    moderate banked turn
+  B2    -45      +/-45    0.45    aggressive bank
+  B3    -60      +/-50    0.65    max bank racing turn
+  C1    -40      +/-30    0.38    combined validation
+  C2    -60      +/-50    0.70    extreme combined
+  D1      0        0      0.02    free-fall drop test
 """
 
 print(REGIME_TABLE)

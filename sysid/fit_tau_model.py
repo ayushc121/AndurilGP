@@ -1,17 +1,10 @@
 """
-fit_tau_model.py
+Power-law fit for the effective vz time constant across thrust steps:
 
-Fits a 2D power-law model for the effective vz time constant:
+    tau_m = a * T_mid^b * dT^c    with T_mid = (T_start+T_end)/2, dT = T_end-T_start
 
-    tau_m = a * T_mid^b * dT^c
-
-where T_mid = (T_start + T_end) / 2
-      dT    = T_end - T_start
-
-Log-linearised form: ln(tau) = ln(a) + b*ln(T_mid) + c*ln(dT)
-This is an ordinary least-squares problem — no nonlinear solver needed.
-
-Add rows to DATA as you collect more runs.
+Log-linearising turns it into plain OLS, no nonlinear solver. Add rows to DATA
+as more step runs come in.
 """
 
 import os
@@ -19,9 +12,7 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-# =============================================================================
 # DATA  [tau_m, T_start, T_end]
-# =============================================================================
 DATA = np.array([
     # fixed T_start = 0.265, vary T_end
     [0.4844,  0.265, 1.000],
@@ -46,9 +37,7 @@ T_end   = DATA[:, 2]
 T_mid   = (T_start + T_end) / 2.0
 dT      = T_end - T_start
 
-# =============================================================================
 # Fit: ln(tau) = ln(a) + b*ln(T_mid) + c*ln(dT)
-# =============================================================================
 ln_tau  = np.log(tau)
 ln_Tmid = np.log(T_mid)
 ln_dT   = np.log(dT)
@@ -79,9 +68,7 @@ for i in range(len(tau)):
           f"{tau[i]:9.4f}  {tau_pred[i]:9.4f}  {err_pct:+7.2f}%")
 print()
 
-# =============================================================================
 # Surface plot: tau_m over (T_mid, dT) grid
-# =============================================================================
 Tmid_grid = np.linspace(0.15, 0.90, 60)
 dT_grid   = np.linspace(0.05, 0.75, 60)
 TM, DT    = np.meshgrid(Tmid_grid, dT_grid)

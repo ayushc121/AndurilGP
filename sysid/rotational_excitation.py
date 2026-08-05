@@ -1,43 +1,16 @@
 """
-rotational_excitation.py
-========================
-Extension to sysid_excitation.py for identifying rotational dynamics surfaces.
+Rotational-axis doublets, on top of sysid_excitation.
 
-Adds `run_rotational_doublet` and a grid runner that sweeps:
-  axes × T_levels × amplitudes × reps
+Sweeps axes x collective thrust x amplitude x reps and writes one CSV plus one
+metadata JSON per doublet. Only the 'excitation' rows get fitted.
 
-Output files per doublet:
-  rot_{axis}_{T_str}_{amp_str}_{rep}.csv
-  rot_{axis}_{T_str}_{amp_str}_{rep}_meta.json
+Call run_doublet_grid(controller) from the flight loop, or
+run_rotational_doublet() for a single test. The controller has to expose
+send_attitude_rates, get_odometry, get_imu and sleep.
 
-CSV columns: t, x, y, z, vx_b, vy_b, vz_b, phi, theta, psi, p, q, r,
-             ax_b, ay_b, az_b, cmd_roll, cmd_pitch, cmd_yaw, cmd_thrust,
-             phase_tag
-phase_tag values: settle | excitation | post_settle
-
-USAGE
------
-Import and call `run_doublet_grid()` from your flight loop, or call
-`run_rotational_doublet()` directly for a single test.
-
-    from rotational_excitation import run_doublet_grid
-    controller = ...   # your object that has .send_attitude_rates and .get_state
-    run_doublet_grid(controller)
-
-The controller object must expose:
-    controller.send_attitude_rates(roll, pitch, yaw, thrust)
-    controller.get_odometry()   -> dict with qw,qx,qy,qz,x,y,z,vx,vy,vz,
-                                          rollspeed,pitchspeed,yawspeed
-    controller.get_imu()        -> dict with xacc,yacc,zacc  (or None)
-    controller.sleep(seconds)   -> accurate sleep
-
-SIGN CONVENTIONS
-----------------
-- NED frame: positive z is downward.
-- Positive cmd_pitch → positive thetadot (nose up) in the sim.
-- Raw pitchspeed from odometry = −thetadot.  The MATLAB script corrects for
-  this; we do NOT negate in this Python file so the CSV stores raw values.
-- body-frame velocities are delivered directly by the odometry.
+Signs: NED, so +z is down. Positive cmd_pitch gives nose-up in the sim, but raw
+pitchspeed from odometry comes back as -thetadot. The CSV keeps the raw value
+and the MATLAB side corrects it, so don't negate here too.
 """
 
 import math
@@ -47,9 +20,7 @@ import json
 import os
 import numpy as np
 
-# =============================================================================
 # Test grid configuration
-# =============================================================================
 AXES        = ['roll', 'pitch', 'yaw']
 T_LEVELS    = [0.25, 0.35, 0.45, 0.55, 0.65, 0.80]
 AMPLITUDES  = [0.3, 0.6, 1.0]
@@ -97,9 +68,7 @@ CSV_HEADER = [
 OUT_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
-# =============================================================================
 # Helpers
-# =============================================================================
 
 def _unpack_odometry(odometry):
     """Returns (qw,qx,qy,qz, x,y,z, vx,vy,vz, p,q,r, phi,theta,psi)."""
@@ -145,9 +114,7 @@ def _tag(axis, T_coll, amplitude, rep):
     return f'rot_{axis}_T{T_coll:.2f}_A{amplitude:.2f}_r{rep}'
 
 
-# =============================================================================
 # Single doublet runner
-# =============================================================================
 
 def run_rotational_doublet(controller, axis, T_collective, amplitude,
                             half_duration=HALF_DURATION,
@@ -184,7 +151,7 @@ def run_rotational_doublet(controller, axis, T_collective, amplitude,
         print(f'[ROT-SYSID]   axis={axis}  T={T_collective:.2f}  amp={amplitude:.2f}'
               f'  half_dur={half_duration:.3f}s  rep={rep}/{n_reps}')
 
-        # --- Open CSV with line buffering so data survives abrupt exits ------
+        # line-buffered so data survives an abrupt exit
         csv_file = open(csv_path, 'w', newline='', buffering=1)
         writer   = csv.writer(csv_file)
         writer.writerow(CSV_HEADER)
@@ -227,7 +194,7 @@ def run_rotational_doublet(controller, axis, T_collective, amplitude,
                 print(f'[ROT-SYSID] Psi locked={math.degrees(psi):.1f}deg  '
                       f'alt_target_z={zp:.2f}m (NED)')
 
-            # --- Phase transitions -------------------------------------------
+            # phase transitions
             if phase == 'settle':
                 # Check settle condition: all rates < threshold for SETTLE_WINDOW
                 all_settled = (abs(p_r) < SETTLE_RATE_THRESH and
@@ -267,7 +234,7 @@ def run_rotational_doublet(controller, axis, T_collective, amplitude,
                 if (t_now - t_post_start) >= POST_SETTLE:
                     break  # done
 
-            # --- Commands ---------------------------------------------------
+            # commands
             # Tilt-compensated thrust + altitude hold
             tilt_comp   = _tilt_thrust(qx, qy)
             alt_err     = zp - alt_target          # >0 = below target (NED)
@@ -310,7 +277,7 @@ def run_rotational_doublet(controller, axis, T_collective, amplitude,
 
             controller.send_attitude_rates(roll_cmd, pitch_cmd, yaw_cmd, thrust_cmd)
 
-            # --- Log --------------------------------------------------------
+            # log
             writer.writerow([
                 f'{t_el:.5f}',
                 f'{xp:.5f}', f'{yp:.5f}', f'{zp:.5f}',
@@ -325,7 +292,7 @@ def run_rotational_doublet(controller, axis, T_collective, amplitude,
 
             controller.sleep(DT)
 
-        # --- Close CSV and write metadata ------------------------------------
+        # close out
         csv_file.flush()
         csv_file.close()
         print(f'[ROT-SYSID] Data saved → {csv_path}')
@@ -351,9 +318,7 @@ def run_rotational_doublet(controller, axis, T_collective, amplitude,
             time.sleep(2.0)
 
 
-# =============================================================================
 # Grid runner
-# =============================================================================
 
 def run_doublet_grid(controller,
                      axes=None,

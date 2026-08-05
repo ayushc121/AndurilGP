@@ -24,9 +24,7 @@ from pymavlink import mavutil
 
 from . import vision as vis
 
-# --------------------------------------------------------------------------
 # Loop timing
-# --------------------------------------------------------------------------
 
 CONTROL_HZ = 50               # spec caps the command rate below 100 Hz
 DT         = 1.0 / CONTROL_HZ
@@ -35,21 +33,16 @@ DEBUG_EVERY_N = 50            # print one telemetry line per second
 ARM_RETRY_S      = 1.0        # re-send arm command this often until it takes
 POST_DISARM_WAIT = 0.25       # settle time before re-arming after a sim reset
 
-# --------------------------------------------------------------------------
 # Guidance — gate position to velocity setpoint
-# --------------------------------------------------------------------------
 
 V_MAX       = 5.0   # m/s cap on the proportional part of the setpoint
 K_POS       = 1.0   # (m/s) of setpoint per metre of position error
 V_MIN_CLOSE = 1.0   # m/s floor on the along-course setpoint (see _velocity_setpoint)
 
-# Aim above gate centre, just past the 0.75 m half-opening. The altitude loop
-# lags a descending course and settles low, so aiming high lands it centred.
+# aim above gate centre — the altitude loop lags a descent and settles low
 GATE_RISE_M = 0.8
 
-# --------------------------------------------------------------------------
 # Attitude — velocity error to bank/pitch angle
-# --------------------------------------------------------------------------
 
 K_VX_P          = 5.0    # deg of pitch per m/s of north-velocity error
 K_VY_P          = 5.0    # deg of roll  per m/s of east-velocity error
@@ -58,17 +51,13 @@ PITCH_LIMIT_DEG = 50.0
 ROLL_LIMIT_DEG  = 50.0
 COURSE_YAW_RAD  = math.pi   # face south down the corridor for the whole run
 
-# --------------------------------------------------------------------------
 # Vision fallback — see _vision_gate_position
-# --------------------------------------------------------------------------
 
 GATE_WIDTH_M          = 2.7    # outer frame, the pinhole range basis
 CAM_TILT_DEG          = 20.0   # camera is pitched up from the body frame
 VISION_ELEV_OFFSET_M  = 1.0    # empirical bias correction on the back-projection
 
-# --------------------------------------------------------------------------
 # Thrust — altitude PD
-# --------------------------------------------------------------------------
 
 HOVER_THRUST    = 0.265   # measured hover trim (see sysid/)
 K_ALT_P         = 0.05    # thrust per metre of altitude error
@@ -76,9 +65,7 @@ K_ALT_D         = 0.08    # thrust per m/s of vertical speed
 MIN_TILT_FACTOR = 0.01    # guards the divide when the drone is near-vertical
 
 
-# --------------------------------------------------------------------------
 # Math helpers
-# --------------------------------------------------------------------------
 
 def euler_to_quat(roll, pitch, yaw):
     """ZYX Euler angles (radians, NED) to quaternion [w, x, y, z]."""
@@ -102,10 +89,8 @@ def quat_to_euler(qw, qx, qy, qz):
 
 
 def body_to_world_velocity(odo):
-    """
-    Rotate body-frame odometry velocity into NED. The sim reports body frame;
-    guidance compares against a world-frame setpoint.
-    """
+    """Rotate body-frame odometry velocity into NED. The sim reports body frame,
+    guidance compares against a world-frame setpoint."""
     qw, qx, qy, qz = odo['qw'], odo['qx'], odo['qy'], odo['qz']
     vx, vy, vz = odo['vx'], odo['vy'], odo['vz']
     return (
@@ -116,10 +101,8 @@ def body_to_world_velocity(odo):
 
 
 def tilt_factor(qx, qy):
-    """
-    cos(roll)*cos(pitch) — the vertical share of thrust once tilted. Dividing
-    the command by it keeps lift constant through a turn.
-    """
+    """cos(roll)*cos(pitch), the vertical share of thrust once tilted. Dividing
+    the command by it keeps lift constant through a turn."""
     return max(MIN_TILT_FACTOR, 1.0 - 2.0 * (qx * qx + qy * qy))
 
 
@@ -129,9 +112,7 @@ class Phase(Enum):
     FLYING = auto()
 
 
-# --------------------------------------------------------------------------
 # Controller
-# --------------------------------------------------------------------------
 
 class Controller:
     """Flies the VQ1 course. `update()` paces itself; main.py just loops."""
@@ -152,7 +133,7 @@ class Controller:
         self._prev_vy_err = 0.0
         print('Controller state reset.', flush=True)
 
-    # ---------------------------------------------------------------- public
+    # public
 
     def arm(self):
         self._send_arm()
@@ -185,13 +166,11 @@ class Controller:
     def _idle(self):
         time.sleep(DT)
 
-    # ------------------------------------------------------------ arm / reset
+    # arm / reset
 
     def _handle_disarm(self, armed, lock):
-        """
-        Detect a sim reset and hold off re-arming until it settles. True means
-        skip this tick. Keeps one process alive across many attempts.
-        """
+        """Detect a sim reset and hold off re-arming until it settles. True means skip
+        this tick. Keeps one process alive across many attempts."""
         if self._was_armed and not armed:
             if self._disarm_at is None:
                 print('Disarm detected — waiting before re-arm.', flush=True)
@@ -228,11 +207,9 @@ class Controller:
             self.phase = Phase.WAIT_FOR_START
 
     def _wait_for_start(self, race_status):
-        """
-        Hold until the countdown elapses. `race_start_boot_time_ms` persists
-        across runs, so it is only trusted once it is at or after the clock
-        reading taken when this phase began.
-        """
+        """Hold until the countdown elapses. `race_start_boot_time_ms` persists across
+        runs, so only trust it once it is at or past the clock reading taken when
+        this phase began."""
         if race_status is None:
             if self._tick % DEBUG_EVERY_N == 0:
                 print('[WAIT] No race_status yet — holding...', flush=True)
@@ -249,7 +226,7 @@ class Controller:
             print('Countdown complete — flying.', flush=True)
             self.phase = Phase.FLYING
 
-    # ------------------------------------------------------------- navigation
+    # navigation
 
     def _target_gate(self, race_status, gates):
         """Centre of the gate the sim wants next, as (north, east, down)."""
@@ -263,37 +240,27 @@ class Controller:
 
     @staticmethod
     def _velocity_setpoint(error_n, error_e):
-        """
-        Velocity setpoint toward the gate, m/s NED.
-
-        North carries a V_MIN_CLOSE floor: a pure P term decays to zero at the
-        gate plane and never triggers the advance. East has no floor, because
-        settling to zero laterally is the goal.
-        """
+        """Velocity setpoint toward the gate, m/s NED. North carries a V_MIN_CLOSE
+        floor — a pure P term decays to zero at the gate plane and never triggers
+        the advance. East has no floor; settling to zero laterally is the goal."""
         v_n = V_MIN_CLOSE * np.sign(error_n) + np.clip(K_POS * error_n, -V_MAX, V_MAX)
         v_e = np.clip(K_POS * error_e, -V_MAX, V_MAX)
         return float(v_n), float(v_e)
 
     @staticmethod
     def _vision_gate_position(vision, odometry, roll_deg, pitch_deg, yaw_deg):
-        """
-        Back-project a gate detection to a world-frame position, or None.
+        """Back-project a gate detection to a world-frame position, or None.
 
-        Range comes from the bbox width against the known 2.7 m gate. The pixel
-        offset gives a ray, which is rotated camera -> body (fixed 20 deg up
-        tilt) -> world (drone attitude), scaled by range, and added to the
-        drone's position.
-
-        This is the whole VQ1 vision path, and it is why the detector could be
-        developed here at all: it produces a real target every frame, so any
-        error in it shows up immediately against the telemetry gate that
-        actually does the flying.
-        """
+        Range from bbox width against the known 2.7 m gate, pixel offset gives a
+        ray, rotated camera -> body (fixed 20 deg tilt) -> world, scaled and added
+        to our own position. This is the whole VQ1 vision path, and the reason the
+        detector could be built here: it produces a real target every frame, so an
+        error in it shows up immediately against the telemetry gate that is
+        actually doing the flying."""
         if vision is None or not vision.get('bw'):
             return None
 
-        # Pixel ray from the bbox centre. Bbox centre, not contour centroid —
-        # the gate is hollow, so the centroid drifts toward the thicker side.
+        # bbox centre, not centroid — hollow gate drifts the centroid
         vc_x = (vision['bx'] + vision['bw'] / 2.0) - vis.CX
         vc_y = (vision['by'] + vision['bh'] / 2.0) - vis.CY
         vc_z = vis.FX
@@ -328,11 +295,8 @@ class Controller:
             odometry['qw'], odometry['qx'], odometry['qy'], odometry['qz'])
         vel_n, vel_e, vel_d = body_to_world_velocity(odometry)
 
-        # Vision runs first and produces a target on its own; telemetry then
-        # overrides it whenever gate positions are available. That ordering is
-        # deliberate and is how the detector got developed — it flew the full
-        # course live on every run, steering nothing, while the telemetry
-        # target beside it did the actual flying.
+        # vision first, telemetry overrides it. that ordering is how the
+        # detector got developed — flew live every run, steered nothing
         target = self._vision_gate_position(
             self.data.get('vision_gate_estimate'), odometry,
             roll_deg, pitch_deg, yaw_deg)
@@ -377,21 +341,18 @@ class Controller:
                   f'cmd=(r={roll_des:+.0f} p={pitch_des:+.0f} T={thrust:.3f})',
                   flush=True)
 
-        # The sim's positive-roll convention is opposite to the NED sense used
-        # above, so the roll command is negated on the way out.
+        # sim roll convention is opposite to NED, so negate on the way out
         self._send_attitude_target(-roll_des, pitch_des, COURSE_YAW_RAD, thrust)
 
     def _hold(self, odometry, vel_d):
-        """
-        Hold altitude with no gate to chase. Hover thrust alone only cancels
-        gravity — the damping term is what arrests an existing vertical rate.
-        """
+        """Hold altitude with no gate to chase. Hover thrust only cancels gravity —
+        the damping term is what arrests an existing vertical rate."""
         thrust = (HOVER_THRUST + vel_d * K_ALT_D) / tilt_factor(
             odometry['qx'], odometry['qy'])
         self._send_attitude_target(0.0, 0.0, COURSE_YAW_RAD,
                                    float(np.clip(thrust, 0.0, 1.0)))
 
-    # ---------------------------------------------------------------- mavlink
+    # mavlink
 
     def _send_attitude_target(self, roll_deg, pitch_deg, yaw_rad, thrust):
         """Type mask 7 = use the quaternion, ignore the body-rate fields."""
