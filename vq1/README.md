@@ -18,7 +18,7 @@ than one:
 
 ```
 gate position ──► velocity setpoint ──► attitude setpoint ──► sim
-                       (P)                     (PD)
+                       (P)                     
 ```
 
 Splitting it matters. A direct position-to-attitude law has to be tuned for a
