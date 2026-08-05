@@ -36,7 +36,7 @@ POST_DISARM_WAIT = 0.25
 # --------------------------------------------------------------------------
 
 G                = 9.81
-HOVER_THRUST     = 0.264   # measured hover trim (see sysid/)
+HOVER_THRUST     = 0.265   # measured hover trim (see sysid/)
 LAUNCH_PITCH_DEG = -17.8   # the drone starts on an angled launch block
 
 # Moving average over the accelerometer: ~42 ms window at 120 Hz. Kills the
