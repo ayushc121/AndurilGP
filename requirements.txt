@@ -1,0 +1,10 @@
+# Flight client and tests
+pymavlink>=2.4
+numpy>=1.24
+opencv-python>=4.8
+pytest>=7.0
+
+# Only needed to re-run the fits in sysid/
+matplotlib>=3.7
+pandas>=2.0
+scipy>=1.10
