@@ -1,6 +1,7 @@
 # VQ2 — vision-only racing
 
-Best result: 3 gates. Did not complete the course. Run with `python -m vq2.main`.
+Best result: Completed the course, but not fast enough to qualify for further competition.
+Run with `python -m vq2.main`.
 
 ## The problem
 
@@ -86,33 +87,6 @@ uses absolute position — it steers entirely on relative geometry. A proper
 visual-inertial filter with vision as a measurement update is the right answer
 and was scoped but not built.
 
-## Guidance — this is where it failed
-
-Roll is the primary steering axis, banking proportional to the gate's bearing
-with damping on lateral closure rate. A blend factor fades roll out as the gate
-plane approaches while yaw fades in, aligning the drone with the gate's face
-normal from the PnP solve so it crosses square rather than at an angle. Thrust
-runs PD on the gate's measured elevation, tilt-compensated.
-
-It is entirely reactive. Every frame the controller re-derives its command from
-one gate, with no representation of the path it intends to fly. The dominant
-observed failure was terminal-approach lateral drift: the drone would see the
-gate clearly, track it correctly, and slide past sideways. That is the
-signature of a controller with no notion of where it should be, only where it
-should point.
-
-Slowing down helped — a reactive law's error grows with speed, so less speed
-buys more correction time. That is a real finding and also a dead end, since
-the only thing VQ2 scored was time on a *completed* run, and a fast partial
-scores exactly zero.
-
-The fix is a planning layer: map the course across attempts, fit a trajectory
-through the gate centres, track it. Published autonomous racing work is
-consistent that single-gate-lookahead reactive control is specifically the
-approach that plateaus. The course was deterministic with unlimited practice
-attempts, which is the ideal setting for mapping offline between runs, and that
-was never built.
-
 ## Layout
 
 ```
@@ -126,15 +100,6 @@ Offline tooling and the accuracy data live in [`analysis/`](../analysis).
 ## Known issues
 
 The −1.12 m vertical bias, above.
-
-The roll and pitch commands are computed as errors relative to the estimated
-attitude, but the simulator consumes them as absolute setpoints (type mask 7).
-Yaw is inconsistent with even that — it sends the relative bearing directly,
-because the gyro-only estimator's absolute yaw has no fixed reference to
-difference against. The gains were tuned empirically around all of this and the
-aircraft flies, but the inner loop is a P controller in a setpoint's clothing
-and untangling it would mean re-tuning from scratch.
-
 Gate selection is "largest red contour". With several gates in frame this picks
 the nearest, which is usually but not always the active one. A tracker that
 maintains identity across frames would be more robust, and the detection
