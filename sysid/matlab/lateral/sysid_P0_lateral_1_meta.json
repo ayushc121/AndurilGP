@@ -1,0 +1,25 @@
+{
+  "regime_id": "P0",
+  "excite_axis": "lateral",
+  "repetition": 1,
+  "theta0_deg": 0.0,
+  "phi0_deg": 0.0,
+  "T0_nominal": 0.265,
+  "control_hz": 100,
+  "settle_dur": 4.0,
+  "hold_dur": 3.0,
+  "excite_dur": 60.0,
+  "recovery_dur": 4.0,
+  "unit_3211": 0.35,
+  "amp_used": 0.0,
+  "lat_phi_sequence_deg": [
+    10,
+    -10,
+    18,
+    -18,
+    26,
+    -26
+  ],
+  "lat_step_dur": 10.0,
+  "notes": ""
+}
