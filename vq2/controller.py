@@ -39,6 +39,11 @@ G                = 9.81
 HOVER_THRUST     = 0.265   # measured hover trim (see sysid/)
 LAUNCH_PITCH_DEG = -17.8   # the drone starts on an angled launch block
 
+# Heading of the launch pad. Yaw is an absolute setpoint, so a wrong value here
+# snaps the nose the moment thrust comes up — the "release kick" was this
+# constant sitting 90 deg out.
+LAUNCH_YAW_CMD_DEG = 90.0
+
 # Thrust-to-acceleration constant, from the hover equilibrium in sysid/.
 THRUST_ACCEL_COEFF = G / HOVER_THRUST ** 2
 
@@ -63,6 +68,10 @@ ELEV_RATE_CLAMP_M_S      = 5.0
 
 BEARING_CLAMP_DEG = 25.0   # bearing feeding the roll loop
 YAW_CLAMP_DEG     = 12.0   # tighter: yaw authority is limited on purpose
+YAW_RATE_LIMIT_DEG_S = 45.0
+
+# +1 was flown and gave positive feedback — the nose ran away from the gate.
+YAW_BEARING_SIGN = -1.0
 PERP_BLEND_DIST_M = 6.0    # inside this range, yaw shifts from bearing to normal
 TILT_EMA_ALPHA    = 0.25   # PnP gate-normal is ~±10 deg noisy; this gets it to ~±4
 MIN_RANGE_FOR_ELEV_M = 3.0 # below this the gate fills the frame; geometry is junk
@@ -75,9 +84,8 @@ MAX_BANK_DEG      = 25.0
 K_P_THRUST = 0.014         # thrust per metre of gate elevation error
 K_D_THRUST = 0.0175        # thrust per m/s of vertical closure
 
-# The sim's roll and yaw axes run opposite to NED; pitch agrees.
+# The sim's roll axis runs opposite to NED; pitch agrees.
 ROLL_CMD_SIGN = -1.0
-YAW_CMD_SIGN  = -1.0
 
 
 # --------------------------------------------------------------------------
@@ -245,6 +253,8 @@ class Controller:
         # Vision state. Within a run `_elev_err` survives a detection gap on
         # purpose — see `_observe_gate`.
         self._elev_err = 0.0
+        self._yaw_cmd = LAUNCH_YAW_CMD_DEG   # absolute heading setpoint
+        self._yaw_frame = None
         self._tilt_ema = None
         self._vis_vy_ema = 0.0
         self._vis_vz_ema = 0.0
@@ -541,6 +551,29 @@ class Controller:
             self._last_damping_frame = view.frame_id
         return lateral, vertical, 'vision' if fresh else 'none'
 
+    def _step_yaw(self, view):
+        """
+        Walk the absolute heading setpoint toward the gate, rate limited.
+
+        The bearing is the raw camera ray, never the AHRS-derived one: routing
+        it through estimated attitude closes a loop on the filter's own error.
+        With no gate in view the setpoint is held, not steered.
+        """
+        if not view.valid:
+            return self._yaw_cmd
+        # One 30 Hz frame covers two 60 Hz ticks, and the step is relative to
+        # the last command, so consuming it twice slews at double the limit.
+        if view.frame_id is not None and view.frame_id == self._yaw_frame:
+            return self._yaw_cmd
+        self._yaw_frame = view.frame_id
+
+        step_limit = YAW_RATE_LIMIT_DEG_S / CONTROL_HZ
+        correction = YAW_BEARING_SIGN * float(np.clip(
+            view.bearing_deg, -YAW_CLAMP_DEG, YAW_CLAMP_DEG))
+        self._yaw_cmd += float(np.clip(correction, -step_limit, step_limit))
+        self._yaw_cmd = (self._yaw_cmd + 180.0) % 360.0 - 180.0
+        return self._yaw_cmd
+
     def _fly(self):
         """Run one guidance/control pass and send the resulting setpoint."""
         with self._state_lock:
@@ -564,13 +597,7 @@ class Controller:
         d_lat = K_LAT_D * d_lateral * view.blend
         roll_target = float(np.clip(p_lat - d_lat, -MAX_BANK_DEG, MAX_BANK_DEG))
 
-        yaw_bearing = float(np.clip(view.bearing_deg, -YAW_CLAMP_DEG, YAW_CLAMP_DEG))
-        if view.valid and not math.isnan(view.tilt_deg):
-            yaw_target = view.blend * yaw_bearing + (1.0 - view.blend) * view.tilt_deg
-        elif view.valid:
-            yaw_target = yaw_bearing
-        else:
-            yaw_target = 0.0
+        yaw_target = self._step_yaw(view)
 
         # PD on gate elevation, divided by the lift lost to tilt.
         # Positive elev_err means the gate is below us.
@@ -588,9 +615,9 @@ class Controller:
                   f'cmd=(r={roll_target:+5.1f} y={yaw_target:+5.1f} T={thrust:.3f})',
                   flush=True)
 
-        # Old PID controller discarded in favor of newly available attitude target function for more stability.
-        # The sim's positive-roll convention is opposite to the NED sense
-        self._send_attitude_target(-roll_target , DESIRED_PITCH_DEG, yaw_target, thrust)
+        # Absolute setpoints, not errors — the sim closes its own attitude loop.
+        self._send_attitude_target(ROLL_CMD_SIGN * roll_target,
+                                   DESIRED_PITCH_DEG, yaw_target, thrust)
 
     # ---------------------------------------------------------------- mavlink
 
