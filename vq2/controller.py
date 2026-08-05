@@ -547,14 +547,8 @@ class Controller:
                   f'cmd=(r={roll_target:+5.1f} y={yaw_target:+5.1f} T={thrust:.3f})',
                   flush=True)
 
-        # Roll and pitch are unity-gain P on attitude error; yaw is the raw
-        # relative bearing. The sim takes all three as absolute setpoints —
-        # see the README's "known issues".
-        self._send_attitude_target(
-            ROLL_CMD_SIGN * (roll_target - roll_deg),
-            DESIRED_PITCH_DEG - pitch_deg,
-            YAW_CMD_SIGN * yaw_target,
-            thrust)
+        # Old PID controller discarded in favor of newly available attitude target function for more stability.
+        self._send_attitude_target(roll_target , -DESIRED_PITCH_DEG, yaw_target, thrust)
 
     # ---------------------------------------------------------------- mavlink
 
