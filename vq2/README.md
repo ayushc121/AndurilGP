@@ -138,13 +138,6 @@ not from the AHRS — routing it through estimated attitude closes a loop on the
 filter's own error. The step is gated on frame ID, since one 30 Hz frame spans
 two 60 Hz ticks and a relative step would otherwise apply twice.
 
-Yaw being an absolute setpoint also makes the pad heading a real constant. It
-was 90° out on VQ2, so the aircraft snapped to that false heading the instant
-thrust came up. Fixing it dropped peak yaw rate in the first half-second from
-over 200 °/s to about 2, and gate detection went from roughly a quarter of
-frames to about two thirds. It was the single largest measured improvement in
-the project.
-
 ## Known issues
 
 The −1.12 m vertical bias, above.
