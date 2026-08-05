@@ -44,11 +44,8 @@ def shared_data():
 
 
 def render_gate(range_m, centre=(CX, CY), img_size=(IMG_W, IMG_H)):
-    """
-    Synthetic gate: a red square frame at a given range. Projected width is
-    FX * GATE_WIDTH_M / range, so reading it back through the same pinhole
-    model must recover `range_m`.
-    """
+    """Red square frame at a given range. Projected width is FX * GATE_WIDTH_M
+    / range, so the same pinhole model has to recover `range_m`."""
     width = int(round(FX * GATE_WIDTH_M / range_m))
     border = max(2, int(round(width * 0.11)))
     img = np.full((img_size[1], img_size[0], 3), 40, dtype=np.uint8)

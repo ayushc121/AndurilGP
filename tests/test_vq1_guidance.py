@@ -89,9 +89,7 @@ def test_thrust_rises_when_below_target_gate(sim_conn, shared_data):
     assert sim_conn.mav.attitude_targets[-1]['thrust'] > vq1.HOVER_THRUST
 
 
-# --------------------------------------------------------------------------
 # Vision fallback — the path the detector was developed on
-# --------------------------------------------------------------------------
 
 def _centred_bbox(range_m):
     """A gate detection dead ahead at a given range."""
@@ -137,12 +135,7 @@ def test_back_projection_rejects_degenerate_bbox():
 
 
 def test_telemetry_overrides_vision(sim_conn, shared_data):
-    """
-    Both targets are computed every tick; telemetry wins whenever it exists.
-
-    This is what let the detector run live on the real course without being
-    able to affect a run.
-    """
+    """Both targets are computed every tick; telemetry wins whenever it exists."""
     ctrl = vq1.Controller(sim_conn, shared_data, 0)
     shared_data['vision_gate_estimate'] = _centred_bbox(15.0)
     odo = {**LEVEL, 'qw': 1, 'qx': 0, 'qy': 0, 'qz': 0, 'vx': 0, 'vy': 0, 'vz': 0}
