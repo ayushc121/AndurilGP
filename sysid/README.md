@@ -73,6 +73,9 @@ independent. The regression identity holds at all times, not just in steady
 state, so the transient data is equally valid — and it is the only data that
 separates the two coefficients.
 
+**Remaining Parameters** measured and fitted across the flight envelope (primarily
+using `sysid_excitation.py` and `drone_sysid_main.m`).
+
 ## Layout
 
 ```
