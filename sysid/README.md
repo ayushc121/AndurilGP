@@ -82,6 +82,8 @@ using `sysid_excitation.py` and `drone_sysid_main.m`).
 sysid_excitation.py       trim, hold, 3211/doublet, recover — writes CSV + meta
 rotational_excitation.py  attitude-axis variant
 identify_aT.py            thrust-to-acceleration mapping
+fit_tau_model.py          thrust time constant mapping
+fit_vz_step.py            thrust-based vertical velocity modeling 
 matlab/                   equation-error + output-error identification
 thrust/                   step-response data and fits
 ```
