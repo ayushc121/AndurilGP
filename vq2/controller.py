@@ -76,6 +76,11 @@ PERP_BLEND_DIST_M = 6.0    # inside this range, yaw shifts from bearing to norma
 TILT_EMA_ALPHA    = 0.25   # PnP gate-normal is ~±10 deg noisy; this gets it to ~±4
 MIN_RANGE_FOR_ELEV_M = 3.0 # below this the gate fills the frame; geometry is junk
 
+# How long the last elevation error may be held after the gate is lost. Held
+# forever it is a permanent climb or descent with nothing to end it: one run
+# rode a stale +4.32 m error into the ground.
+ELEV_HOLD_MAX_S = 1.5
+
 DESIRED_PITCH_DEG = -3.0   # constant nose-down: the only source of forward speed
 K_BEARING         = 4.5    # deg of bank per deg of bearing error
 K_LAT_D           = 9.0    # deg of bank per m/s of lateral closure
@@ -253,6 +258,7 @@ class Controller:
         # Vision state. Within a run `_elev_err` survives a detection gap on
         # purpose — see `_observe_gate`.
         self._elev_err = 0.0
+        self._elev_err_at = None       # when _elev_err was last measured
         self._yaw_cmd = LAUNCH_YAW_CMD_DEG   # absolute heading setpoint
         self._yaw_frame = None
         self._tilt_ema = None
@@ -463,6 +469,7 @@ class Controller:
             view.elev_rate = self._frame_rate(
                 elev, view.frame_id, '_prev_elev', '_prev_elev_frame')
             self._elev_err = elev
+            self._elev_err_at = time.monotonic()
         # Closer than that, the gate fills the frame: hold the last value.
 
         view.tilt_deg = self._gate_tilt(vision)
@@ -551,6 +558,14 @@ class Controller:
             self._last_damping_frame = view.frame_id
         return lateral, vertical, 'vision' if fresh else 'none'
 
+    def _held_elev_err(self):
+        """Elevation error, or zero once the held value is too old to trust."""
+        if self._elev_err_at is None:
+            return 0.0
+        if time.monotonic() - self._elev_err_at > ELEV_HOLD_MAX_S:
+            return 0.0
+        return self._elev_err
+
     def _step_yaw(self, view):
         """
         Walk the absolute heading setpoint toward the gate, rate limited.
@@ -601,8 +616,9 @@ class Controller:
 
         # PD on gate elevation, divided by the lift lost to tilt.
         # Positive elev_err means the gate is below us.
+        elev_err = self._held_elev_err()
         tilt_loss = max(0.01, math.cos(math.radians(roll_deg)) * math.cos(math.radians(pitch_deg)))
-        thrust = (HOVER_THRUST - self._elev_err * K_P_THRUST
+        thrust = (HOVER_THRUST - elev_err * K_P_THRUST
                   + d_vertical * K_D_THRUST) / tilt_loss
         thrust = float(np.clip(thrust, 0.0, 1.0))
 
@@ -610,7 +626,7 @@ class Controller:
             print(f'[NAV] vel[{vel_source}]=({v_fwd:+5.1f}f {v_right:+5.1f}r {v_down:+5.1f}d) '
                   f'att=({roll_deg:+5.1f}r {pitch_deg:+5.1f}p {yaw_deg:+6.1f}y) '
                   f'gate=({view.fwd:+5.1f}f {view.right:+5.1f}r {view.down:+5.1f}d) '
-                  f'elev={self._elev_err:+5.2f} '
+                  f'elev={elev_err:+5.2f} '
                   f'D[{d_source}]=({d_lateral:+5.2f} {d_vertical:+5.2f}) '
                   f'cmd=(r={roll_target:+5.1f} y={yaw_target:+5.1f} T={thrust:.3f})',
                   flush=True)
