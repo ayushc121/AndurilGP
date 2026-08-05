@@ -39,6 +39,9 @@ G                = 9.81
 HOVER_THRUST     = 0.265   # measured hover trim (see sysid/)
 LAUNCH_PITCH_DEG = -17.8   # the drone starts on an angled launch block
 
+# Thrust-to-acceleration constant, from the hover equilibrium in sysid/.
+THRUST_ACCEL_COEFF = G / HOVER_THRUST ** 2
+
 # Moving average over the accelerometer: ~42 ms window at 120 Hz. Kills the
 # contact and motor spikes that would otherwise integrate into velocity error.
 ACC_SMOOTH_N = 5
@@ -80,6 +83,42 @@ YAW_CMD_SIGN  = -1.0
 # --------------------------------------------------------------------------
 # Attitude estimation
 # --------------------------------------------------------------------------
+
+def quat_to_R_wb(q):
+    """Body-to-world (NED) rotation matrix from a [w, x, y, z] quaternion."""
+    qw, qx, qy, qz = q
+    return np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)],
+        [2 * (qx * qy + qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx)],
+        [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)],
+    ])
+
+
+def body_accel_to_ned(quat, ax, ay, az, cmd_thrust):
+    """
+    Gravity-removed NED acceleration from one accelerometer sample, with the
+    thrust-produced component bounded by what the commanded thrust can make.
+
+    Capping the total instead goes to zero at and below hover, which forbids
+    acceleration exactly while the drone is falling: a real free fall scaled to
+    nothing and inverted the sign of the vertical velocity estimate on 91% of
+    moving ticks. Bounding the thrust part took that to 4%.
+    """
+    qw, qx, qy, qz = quat
+    sf_n = (1 - 2 * (qy * qy + qz * qz)) * ax + 2 * (qx * qy - qw * qz) * ay + 2 * (qx * qz + qw * qy) * az
+    sf_e = 2 * (qx * qy + qw * qz) * ax + (1 - 2 * (qx * qx + qz * qz)) * ay + 2 * (qy * qz - qw * qx) * az
+    sf_d = 2 * (qx * qz - qw * qy) * ax + 2 * (qy * qz + qw * qx) * ay + (1 - 2 * (qx * qx + qy * qy)) * az
+
+    max_accel = THRUST_ACCEL_COEFF * cmd_thrust * cmd_thrust
+
+    thrust_part = np.array([sf_n, sf_e, sf_d])
+    magnitude = float(np.linalg.norm(thrust_part))
+    saturated = magnitude > max_accel
+    if saturated and magnitude > 1e-9:
+        thrust_part *= max_accel / magnitude
+
+    return thrust_part + np.array([0.0, 0.0, G]), max_accel, saturated
+
 
 def euler_to_quat(roll, pitch, yaw):
     """ZYX Euler angles (radians, NED) to quaternion [w, x, y, z]."""
@@ -181,6 +220,8 @@ class Controller:
         self._att_deg = (0.0, LAUNCH_PITCH_DEG, 0.0)
         self._last_imu_ts_us = None
         self._acc_buf = deque(maxlen=ACC_SMOOTH_N)
+        self._last_cmd_thrust = HOVER_THRUST   # feeds the acceleration cap
+        self._accel_saturated = False
 
         self._reset_flight_state()
 
@@ -198,6 +239,8 @@ class Controller:
             self.pos_ned[:] = 0.0
             self._att_deg = (0.0, LAUNCH_PITCH_DEG, 0.0)
             self._acc_buf.clear()
+            self._last_cmd_thrust = HOVER_THRUST
+            self._accel_saturated = False
 
         # Vision state. Within a run `_elev_err` survives a detection gap on
         # purpose — see `_observe_gate`.
@@ -271,13 +314,11 @@ class Controller:
         without bound; only velocity is corrected, and only by vision.
         """
         qw, qx, qy, qz = self.ahrs.quaternion
-        ax, ay, az = acc
+        a_ned, _, saturated = body_accel_to_ned(
+            self.ahrs.quaternion, acc[0], acc[1], acc[2], self._last_cmd_thrust)
+        self._accel_saturated = saturated
 
-        a_n = (1 - 2 * (qy * qy + qz * qz)) * ax + 2 * (qx * qy - qw * qz) * ay + 2 * (qx * qz + qw * qy) * az
-        a_e = 2 * (qx * qy + qw * qz) * ax + (1 - 2 * (qx * qx + qz * qz)) * ay + 2 * (qy * qz - qw * qx) * az
-        a_d = 2 * (qx * qz - qw * qy) * ax + 2 * (qy * qz + qw * qx) * ay + (1 - 2 * (qx * qx + qy * qy)) * az + G
-
-        self.vel_ned += np.array([a_n, a_e, a_d]) * dt
+        self.vel_ned += a_ned * dt
         self.pos_ned += self.vel_ned * dt
 
         vn, ve, vd = self.vel_ned
@@ -555,6 +596,8 @@ class Controller:
 
     def _send_attitude_target(self, roll_deg, pitch_deg, yaw_deg, thrust):
         """Type mask 7 = use the quaternion, ignore the body-rate fields."""
+        with self._state_lock:
+            self._last_cmd_thrust = thrust
         self.sim_conn.mav.set_attitude_target_send(
             int(time.time() * 1000) - self.system_boot_ms,
             self.sim_conn.target_system,
