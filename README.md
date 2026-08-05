@@ -126,3 +126,21 @@ extrinsic mismatch. It was never tracked down.
 minimum-closing-speed floor that its cross-course counterpart does not. The
 asymmetry is deliberate and documented in the code, but it only works because
 the VQ1 course runs along a single axis.
+
+## Next steps
+
+Everything below is aimed at VQ2 lap time. That round is scored on the fastest
+completed run, so speed is what the remaining work is for.
+
+**Path planning.** The controller steers gate to gate with no representation of
+the route it intends to fly, which caps how fast it can safely go. Adding a
+planning layer where we map the course across attempts and flying a fitted
+trajectory through it, rather than reacting to one gate at a time, is what makes
+a faster line possible, and is required for any time-optimal method.
+
+**Learned control.** A policy trained directly against lap time is the more
+ambitious version of the same goal, but it needs far more flight hours than
+real-time runs can produce. That makes a fast offline simulator the real
+prerequisite, built on the dynamics already identified in `sysid/` and once it
+exists, automatically tuning the current controller for speed becomes cheap and
+automatable.
