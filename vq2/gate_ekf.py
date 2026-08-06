@@ -1,7 +1,7 @@
 """
 gate_ekf.py — 6-state gate-correction Kalman filter for vision-only drone racing.
 
-Design: see EKF_DESIGN.md. Reference implementations: Azhari et al. (arXiv 2512.20475,
+Reference implementations: Azhari et al. (arXiv 2512.20475,
 drift-corrected monocular VIO) and JamBoy `ekf.py` (6-state [p,v] NED skeleton).
 
 State (world-NED, metres / m·s⁻¹):
@@ -134,7 +134,7 @@ class GateEKF:
 
 
 # Measurement construction helpers (kept out of the filter core so the KF stays
-# linear and source-neutral — PnP/attitude/map math lives here, per EKF_DESIGN.md §5).
+# linear and source-neutral — PnP/attitude/map math stays out of this file).
 
 def build_R_anisotropic(R_wc, sigma_lat=0.3, sigma_range=1.2):
     """Anisotropic measurement covariance — our key adaptation over both references."""

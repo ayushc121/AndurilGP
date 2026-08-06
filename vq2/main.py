@@ -1,5 +1,5 @@
 """
-VQ2 entry point — vision-only racing, with the gate-relative estimator running.
+VQ2 entry point — vision-only racing. The controller owns the estimator.
 
 Run from the repository root:
 
@@ -10,7 +10,6 @@ import time
 
 from core.setup import run, setup_components
 from .controller import Controller
-from .estimator import GateVIO
 from .vision_rx import VisionRX
 
 SIM_SERVER_UDP_IP = '127.0.0.1'
@@ -25,11 +24,6 @@ def main():
                                   SIM_SERVER_UDP_IP, SIM_SERVER_UDP_PORT,
                                   controller_cls=Controller,
                                   vision_cls=VisionRX)
-
-    # runs alongside the controller, never commands it. see vq2/README.md
-    vio = GateVIO(shared_data)
-    vio.start()
-    components['vio'] = vio
 
     run(components)
 

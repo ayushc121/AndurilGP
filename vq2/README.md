@@ -73,11 +73,19 @@ complementary filter pulls attitude toward the apparent gravity vector, but
 under thrust that vector is gravity *plus* linear acceleration, which describes
 essentially all of a race.
 
-Velocity and position come from `estimator.py`, a six-state filter over
-`[position, velocity]` expressed **relative to the gate currently anchored**.
-The IMU predicts at 400 Hz; each PnP detection is a position measurement that
-corrects it. Working gate-relative means no map is needed, which is the whole
-point — VQ2 does not give you one.
+Velocity, attitude and the gate vector all come from `estimator.py`, a
+six-state filter over `[position, velocity]` expressed **relative to the gate
+currently anchored**. The IMU predicts at 400 Hz; each PnP detection is a
+position measurement that corrects it. Working gate-relative means no map is
+needed, which is the whole point — VQ2 does not give you one.
+
+The controller owns the filter and steers on its output, so there is one
+estimator in the process rather than a controller and a filter integrating the
+same gyro independently. Guidance falls back a rung at a time: **EKF** while
+the anchor is live, **VIS** on the raw detection once it goes stale, and blind
+otherwise. Blind holds wings level and keeps the current heading rather than
+coasting on a drifting estimate — steering while blind measured 2.74 m/s of
+velocity error against 0.56 m/s while tracked.
 
 Three details carry most of the value:
 
@@ -101,7 +109,8 @@ keeps velocity and its covariance, since world velocity does not care which
 gate you are measuring against.
 
 **Measured on a VQ1 flight** with the telemetry controller flying and the
-estimator running blind beside it (`python -m analysis.ekf_accuracy`):
+estimator running blind beside it, which is how its output can be scored
+against real odometry (`python -m analysis.ekf_accuracy`):
 
 | | median | vs baseline |
 |---|---|---|
@@ -117,9 +126,10 @@ both and says so.
 ```
 gate_detector.py   detection, tracking, corner extraction, PnP — pure functions
 vision_rx.py       temporal state and diagnostics on top of core.camera_rx
+ahrs.py            platform constants and the IMU-side attitude math
 gate_ekf.py        six-state [position, velocity] filter, pure numpy
 estimator.py       gate-relative VIO: IMU predicts, PnP corrects
-controller.py      guidance and attitude commands
+controller.py      guidance and attitude commands, steering on the estimate
 ```
 
 Offline tooling and the accuracy data live in [`analysis/`](../analysis).
@@ -129,14 +139,15 @@ Offline tooling and the accuracy data live in [`analysis/`](../analysis).
 Roll steers, banking on the gate's bearing with damping on lateral closure,
 faded out by a blend factor as the gate plane approaches so the drone is not
 still turning as it crosses. Thrust is PD on measured gate elevation,
-tilt-compensated.
+tilt-compensated. Pitch is a constant −3°, the only source of forward speed.
 
 Yaw is a rate-limited nulling integrator: each new camera frame moves the
 commanded heading a step toward the bearing, and with no gate in view the
-setpoint is held rather than steered. The bearing comes from the raw camera ray,
-not from the AHRS — routing it through estimated attitude closes a loop on the
-filter's own error. The step is gated on frame ID, since one 30 Hz frame spans
-two 60 Hz ticks and a relative step would otherwise apply twice.
+setpoint is held rather than steered. The bearing is the raw camera ray, and
+deliberately *not* the filter's `gate_body` — that one is rotated by the AHRS,
+so steering on it would close the yaw loop over the filter's own yaw error.
+The step is gated on frame ID, since one 30 Hz frame spans two 60 Hz ticks and
+a relative step would otherwise apply twice.
 
 Yaw being an absolute setpoint also makes the pad heading a real constant. It
 was 90° out on VQ2, so the aircraft snapped to that false heading the instant
