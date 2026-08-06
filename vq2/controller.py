@@ -2,8 +2,8 @@
 Vision-only gate controller (Virtual Qualifier 2).
 
 VQ2 blocks odometry, attitude and gate positions, leaving a 30 Hz camera and a
-120 Hz IMU. Attitude and velocity come from the IMU; bearing, elevation and
-gate normal come from the camera. Guidance is reactive, with no map and no
+120 Hz IMU. All state comes from the gate-relative estimator in estimator.py —
+this file owns one and steers on it. Guidance is reactive, with no map and no
 planned trajectory — see README for why that capped out at three gates.
 
 Frame is NED (X north, Y east, Z down). More negative Z is higher.
@@ -12,33 +12,23 @@ Frame is NED (X north, Y east, Z down). More negative Z is higher.
 import math
 import threading
 import time
-from collections import deque
 from enum import Enum, auto
 
-import cv2
 import numpy as np
 from pymavlink import mavutil
 
+from .ahrs import HOVER_THRUST, LAUNCH_YAW_CMD_DEG, euler_to_quat
+from .estimator import GateVIO
+
 # Loop timing
 
-CONTROL_HZ         = 60    # command rate: 2:1 with the 30 Hz camera
-ESTIMATION_POLL_HZ = 400   # oversamples the 120 Hz IMU so no sample is missed
-CAMERA_FPS         = 30.0
-DEBUG_EVERY_N      = 20
+CONTROL_HZ    = 60    # command rate: 2:1 with the 30 Hz camera
+CAMERA_FPS    = 30.0
+DEBUG_EVERY_N = 20
 
 ARM_RETRY_S      = 1.0
 POST_DISARM_WAIT = 0.25
-
-G                = 9.81
-HOVER_THRUST     = 0.265   # measured, see sysid/
-LAUNCH_PITCH_DEG = -17.8   # pad is angled
-THRUST_ACCEL_COEFF = G / HOVER_THRUST ** 2
-
-# pad heading. yaw is an absolute setpoint so a wrong value here snaps the
-# nose the moment thrust comes up — this was the "release kick", 90 deg out
-LAUNCH_YAW_CMD_DEG = 90.0
-
-ACC_SMOOTH_N = 5           # ~42 ms at 120 Hz, kills contact/motor spikes
+# Guidance
 
 VIS_VEL_EMA_ALPHA = 0.35   # smooth vision velocity first
 OF_ALPHA          = 0.60   # IMU share of the blend
@@ -52,8 +42,8 @@ YAW_CLAMP_DEG     = 12.0   # tighter on purpose
 YAW_RATE_LIMIT_DEG_S = 45.0
 
 YAW_BEARING_SIGN = -1.0    # +1 was flown, gave positive feedback. don't flip
-PERP_BLEND_DIST_M = 6.0    # inside this, yaw shifts bearing -> normal
-TILT_EMA_ALPHA    = 0.25   # raw normal is ~±10 deg noisy
+YAW_BEARING_MIN_M = 1.0    # below this the bearing is noise, hold instead
+PERP_BLEND_DIST_M = 6.0    # inside this, roll authority fades out
 MIN_RANGE_FOR_ELEV_M = 3.0 # closer than this the gate fills the frame
 
 # hold the last elevation error this long after losing the gate. unbounded,
@@ -71,82 +61,6 @@ K_D_THRUST = 0.0175        # thrust per m/s of vertical closure
 ROLL_CMD_SIGN = -1.0       # sim roll axis is opposite to NED
 
 
-# Attitude estimation
-
-def quat_to_R_wb(q):
-    """Body-to-world (NED) rotation matrix from a [w, x, y, z] quaternion."""
-    qw, qx, qy, qz = q
-    return np.array([
-        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)],
-        [2 * (qx * qy + qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx)],
-        [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)],
-    ])
-
-
-def body_accel_to_ned(quat, ax, ay, az, cmd_thrust):
-    """Gravity-removed, thrust-capped NED acceleration from one accelerometer sample."""
-    qw, qx, qy, qz = quat
-    sf_n = (1 - 2 * (qy * qy + qz * qz)) * ax + 2 * (qx * qy - qw * qz) * ay + 2 * (qx * qz + qw * qy) * az
-    sf_e = 2 * (qx * qy + qw * qz) * ax + (1 - 2 * (qx * qx + qz * qz)) * ay + 2 * (qy * qz - qw * qx) * az
-    sf_d = 2 * (qx * qz - qw * qy) * ax + 2 * (qy * qz + qw * qx) * ay + (1 - 2 * (qx * qx + qy * qy)) * az
-
-    max_accel = THRUST_ACCEL_COEFF * cmd_thrust * cmd_thrust
-
-    # cap the thrust part, not the total — capping |a| goes to zero at hover
-    # and forbids acceleration while falling. inverted vD on 91% of ticks
-    thrust_part = np.array([sf_n, sf_e, sf_d])
-    magnitude = float(np.linalg.norm(thrust_part))
-    saturated = magnitude > max_accel
-    if saturated and magnitude > 1e-9:
-        thrust_part *= max_accel / magnitude
-
-    return thrust_part + np.array([0.0, 0.0, G]), max_accel, saturated
-
-
-def euler_to_quat(roll, pitch, yaw):
-    """ZYX Euler angles (radians, NED) to quaternion [w, x, y, z]."""
-    cy, sy = math.cos(yaw * 0.5), math.sin(yaw * 0.5)
-    cp, sp = math.cos(pitch * 0.5), math.sin(pitch * 0.5)
-    cr, sr = math.cos(roll * 0.5), math.sin(roll * 0.5)
-    return [cr * cp * cy + sr * sp * sy,
-            sr * cp * cy - cr * sp * sy,
-            cr * sp * cy + sr * cp * sy,
-            cr * cp * sy - sr * sp * cy]
-
-
-class GyroAHRS:
-    """Attitude from gyro integration alone, seeded at the known launch pitch.
-    No accelerometer correction on purpose: under thrust the apparent gravity
-    vector is gravity plus linear acceleration, which is most of a race."""
-
-    def __init__(self, initial_pitch_deg=0.0):
-        self.q = np.array(euler_to_quat(0.0, math.radians(initial_pitch_deg), 0.0))
-
-    def update(self, gx, gy, gz, dt):
-        """Integrate one gyro sample (rad/s, sign-corrected). Returns Euler degrees."""
-        qw, qx, qy, qz = self.q
-        h = 0.5 * dt
-        q = np.array([
-            qw + h * (-qx * gx - qy * gy - qz * gz),
-            qx + h * (qw * gx + qy * gz - qz * gy),
-            qy + h * (qw * gy - qx * gz + qz * gx),
-            qz + h * (qw * gz + qx * gy - qy * gx),
-        ])
-        self.q = q / np.linalg.norm(q)
-        return self.euler_deg()
-
-    def euler_deg(self):
-        qw, qx, qy, qz = self.q
-        roll = math.atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy))
-        pitch = math.asin(max(-1.0, min(1.0, 2.0 * (qw * qy - qz * qx))))
-        yaw = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
-        return math.degrees(roll), math.degrees(pitch), math.degrees(yaw)
-
-    @property
-    def quaternion(self):
-        return self.q.copy()
-
-
 class Phase(Enum):
     WAIT_FOR_DATA = auto()
     WAIT_FOR_START = auto()
@@ -156,26 +70,30 @@ class Phase(Enum):
 class GateView:
     """One frame's worth of gate geometry, in the drone's body frame."""
 
-    __slots__ = ('valid', 'frame_id', 'fwd', 'right', 'down',
-                 'bearing_deg', 'bearing_rate', 'elev_rate', 'tilt_deg', 'blend')
+    __slots__ = ('valid', 'source', 'frame_id', 'fwd', 'right', 'down',
+                 'bearing_deg', 'bearing_rate', 'elev_rate', 'blend')
 
     def __init__(self):
         self.valid = False
+        self.source = 'BLIND'
         self.frame_id = None
         self.fwd = self.right = self.down = float('nan')
         self.bearing_deg = 0.0
         self.bearing_rate = 0.0
         self.elev_rate = 0.0
-        self.tilt_deg = float('nan')
         self.blend = 0.0
 
 
 # Controller
 
 class Controller:
-    """Vision-only flight controller. A 400 Hz estimation thread integrates the
-    IMU; the 60 Hz control loop snapshots it and turns the latest detection into
-    an attitude setpoint."""
+    """Vision-only flight controller.
+
+    Owns a GateVIO and steers on its output: attitude, velocity and the gate
+    vector all come from the filter, so there is one estimator in the process
+    rather than a controller and a filter integrating the same gyro apart from
+    each other.
+    """
 
     def __init__(self, sim_conn, data, system_boot_ms):
         self.sim_conn = sim_conn
@@ -183,39 +101,29 @@ class Controller:
         self.system_boot_ms = system_boot_ms
 
         self._state_lock = threading.Lock()
-        self._est_running = False
-        self._est_thread = None
         self._was_armed = False
         self._disarm_at = None
 
-        self.ahrs = GyroAHRS(initial_pitch_deg=LAUNCH_PITCH_DEG)
-        self.vel_ned = np.zeros(3)    # [north, east, down] m/s
-        self.vel_body = np.zeros(3)   # [forward, right, down] m/s
-        self.pos_ned = np.zeros(3)    # metres, relative to the arm point
-        self._att_deg = (0.0, LAUNCH_PITCH_DEG, 0.0)
-        self._last_imu_ts_us = None
-        self._acc_buf = deque(maxlen=ACC_SMOOTH_N)
-        self._last_cmd_thrust = HOVER_THRUST   # feeds the acceleration cap
-        self._accel_saturated = False
+        self.vio = GateVIO(data)
+        self._vio_started = False
 
         self._reset_flight_state()
 
     def _reset_flight_state(self):
-        """Clear per-run state. The estimation thread survives a sim reset."""
+        """Clear per-run state. The estimator thread survives, but is reseeded
+        here rather than relying on the sim's IMU clock to rewind — a stale
+        AHRS yaw would snap the nose to the wrong absolute heading at release.
+        """
+        self.vio.reset()
+        lock = self.data.get('lock')
+        if lock is not None:
+            with lock:
+                self.data['cmd_thrust'] = HOVER_THRUST
         with self._state_lock:
             self.phase = Phase.WAIT_FOR_DATA
             self._last_arm_attempt = 0.0
             self._tick = 0
             self._wait_start_sim_ms = None
-            self._last_imu_ts_us = None
-            self.ahrs = GyroAHRS(initial_pitch_deg=LAUNCH_PITCH_DEG)
-            self.vel_ned[:] = 0.0
-            self.vel_body[:] = 0.0
-            self.pos_ned[:] = 0.0
-            self._att_deg = (0.0, LAUNCH_PITCH_DEG, 0.0)
-            self._acc_buf.clear()
-            self._last_cmd_thrust = HOVER_THRUST
-            self._accel_saturated = False
 
         # Vision state. Within a run `_elev_err` survives a detection gap on
         # purpose — see `_observe_gate`.
@@ -223,7 +131,6 @@ class Controller:
         self._elev_err_at = None       # when _elev_err was last measured
         self._yaw_cmd = LAUNCH_YAW_CMD_DEG   # absolute heading setpoint
         self._yaw_frame = None
-        self._tilt_ema = None
         self._vis_vy_ema = 0.0
         self._vis_vz_ema = 0.0
         self._prev_bearing = None
@@ -243,63 +150,16 @@ class Controller:
 
     # estimation
 
-    def _start_estimation_thread(self):
-        if self._est_thread is not None and self._est_thread.is_alive():
+    def _start_estimator(self):
+        if self._vio_started:
             return
-        self._est_running = True
-        self._est_thread = threading.Thread(target=self._estimation_loop,
-                                            daemon=True, name='imu-estimation')
-        self._est_thread.start()
-        print('IMU estimation thread started.', flush=True)
+        self.vio.start()
+        self._vio_started = True
+        print('Gate-relative estimator started.', flush=True)
 
-    def _estimation_loop(self):
-        interval = 1.0 / ESTIMATION_POLL_HZ
-        while self._est_running:
-            data_lock = self.data.get('lock')
-            if data_lock:
-                with data_lock:
-                    imu = self.data.get('imu')
-                if imu is not None:
-                    self._process_imu(imu)
-            time.sleep(interval)
-
-    def _process_imu(self, imu):
-        """Integrate one IMU sample. Ignores repeats of the last timestamp."""
-        ts_us = imu['time_usec']
-        with self._state_lock:
-            if self._last_imu_ts_us is None:
-                self._last_imu_ts_us = ts_us
-                return
-            if ts_us == self._last_imu_ts_us:
-                return
-            dt = max(0.0005, min(0.1, (ts_us - self._last_imu_ts_us) * 1e-6))
-            self._last_imu_ts_us = ts_us
-
-            # This simulator reports gyro rates inverted relative to NED.
-            self._att_deg = self.ahrs.update(-imu['xgyro'], -imu['ygyro'],
-                                             -imu['zgyro'], dt)
-
-            self._acc_buf.append((imu['xacc'], imu['yacc'], imu['zacc']))
-            n = len(self._acc_buf)
-            acc = [sum(s[i] for s in self._acc_buf) / n for i in range(3)]
-            self._integrate_kinematics(acc, dt)
-
-    def _integrate_kinematics(self, acc, dt):
-        """Strapdown integration: specific force -> NED velocity -> position. Caller
-        holds _state_lock. Position drifts without bound; only velocity is
-        corrected, and only by vision."""
-        qw, qx, qy, qz = self.ahrs.quaternion
-        a_ned, _, saturated = body_accel_to_ned(
-            self.ahrs.quaternion, acc[0], acc[1], acc[2], self._last_cmd_thrust)
-        self._accel_saturated = saturated
-
-        self.vel_ned += a_ned * dt
-        self.pos_ned += self.vel_ned * dt
-
-        vn, ve, vd = self.vel_ned
-        self.vel_body[0] = (1 - 2 * (qy * qy + qz * qz)) * vn + 2 * (qx * qy + qw * qz) * ve + 2 * (qx * qz - qw * qy) * vd
-        self.vel_body[1] = 2 * (qx * qy - qw * qz) * vn + (1 - 2 * (qx * qx + qz * qz)) * ve + 2 * (qy * qz + qw * qx) * vd
-        self.vel_body[2] = 2 * (qx * qz + qw * qy) * vn + 2 * (qy * qz - qw * qx) * ve + (1 - 2 * (qx * qx + qy * qy)) * vd
+    def get_thread_for_join(self):
+        """Shutdown hook — core.setup joins this on the way out."""
+        return self.vio.get_thread_for_join()
 
     # control
 
@@ -363,7 +223,7 @@ class Controller:
                 self._last_arm_attempt = now
             return
         if imu is not None:
-            self._start_estimation_thread()
+            self._start_estimator()
             print('Armed and IMU ready. Waiting for race start.', flush=True)
             self.phase = Phase.WAIT_FOR_START
         else:
@@ -387,23 +247,37 @@ class Controller:
 
     # guidance
 
-    def _observe_gate(self, vision, quat):
-        """Turn the latest detection into body-frame gate geometry."""
+    def _observe_gate(self, vision, quat, est=None):
+        """Body-frame gate geometry, from the filter if it has a live anchor.
+
+        Two rungs. EKF is the filtered estimate and survives a dropped frame;
+        VIS is the raw detection, used while the anchor is stale. Neither means
+        blind, and blind must not steer — coasting on a drifting estimate
+        measured 2.74 m/s of velocity error against 0.56 while tracked.
+        """
         view = GateView()
-        if vision is None:
-            self._tilt_ema = None
+
+        gate_body = None
+        if est is not None and est.valid and not est.stale:
+            gate_body = est.gate_body
+            view.source = 'EKF'
+        elif vision is not None:
+            gate_body = (vision.get('body_x_m', float('nan')),
+                         vision.get('body_y_m', float('nan')),
+                         vision.get('body_z_m', float('nan')))
+            view.source = 'VIS'
+
+        if gate_body is None:
             self._prev_bearing = self._prev_bearing_frame = None
             self._prev_elev = self._prev_elev_frame = None
             return view
 
-        view.frame_id = vision.get('frame_id')
-        view.fwd = vision.get('body_x_m', float('nan'))
-        view.right = vision.get('body_y_m', float('nan'))
-        view.down = vision.get('body_z_m', float('nan'))
+        view.frame_id = vision.get('frame_id') if vision is not None else None
+        view.fwd, view.right, view.down = (float(v) for v in gate_body)
         if any(math.isnan(v) for v in (view.fwd, view.right, view.down)) or view.fwd <= 0.1:
-            self._tilt_ema = None
             self._prev_bearing = self._prev_bearing_frame = None
             self._prev_elev = self._prev_elev_frame = None
+            view.source = 'BLIND'
             return view
 
         view.valid = True
@@ -425,7 +299,6 @@ class Controller:
             self._elev_err_at = time.monotonic()
         # closer than that the gate fills the frame — hold the last value
 
-        view.tilt_deg = self._gate_tilt(vision)
         return view
 
     def _frame_rate(self, value, frame_id, value_attr, frame_attr):
@@ -440,28 +313,6 @@ class Controller:
             setattr(self, value_attr, value)
             setattr(self, frame_attr, frame_id)
         return rate
-
-    def _gate_tilt(self, vision):
-        """Gate face normal in the body frame. EMA'd, because raw PnP normals are
-        ~±10 deg noisy, and reset on dropout."""
-        if not (vision.get('pnp_ok') and vision.get('pnp_rvec') is not None):
-            self._tilt_ema = None
-            return float('nan')
-
-        rotation, _ = cv2.Rodrigues(np.array(vision['pnp_rvec'], dtype=np.float64))
-        normal = rotation @ np.array([0.0, 0.0, 1.0])
-        if normal[2] > 0:      # IPPE returns a sign-ambiguous normal
-            normal = -normal
-
-        # Camera is pitched 20 deg up from the body frame.
-        ct, st = math.cos(math.radians(20.0)), math.sin(math.radians(20.0))
-        fwd = ct * (-normal[2]) + st * (-normal[1])
-        right = -normal[0]
-        raw = float(np.clip(math.degrees(math.atan2(right, fwd)), -30.0, 30.0))
-
-        self._tilt_ema = raw if self._tilt_ema is None else (
-            TILT_EMA_ALPHA * raw + (1.0 - TILT_EMA_ALPHA) * self._tilt_ema)
-        return self._tilt_ema
 
     def _fuse_velocity(self, vision_vel, frame_id, v_right, v_down):
         """Correct lateral/vertical velocity with vision, once per camera frame.
@@ -503,19 +354,33 @@ class Controller:
             self._last_damping_frame = view.frame_id
         return lateral, vertical, 'vision' if fresh else 'none'
 
-    def _step_yaw(self, view):
-        """Walk the absolute heading setpoint toward the gate, rate-limited."""
-        if not view.valid:
+    def _step_yaw(self, vision):
+        """Walk the absolute heading setpoint toward the gate, rate-limited.
+
+        Deliberately the raw camera bearing, not the filter's `gate_body`: that
+        one is rotated by the AHRS, so steering on it closes the yaw loop over
+        the filter's own yaw error. This is the only attitude-free bearing in
+        the tree. With no gate the setpoint is held, not steered.
+        """
+        if vision is None:
             return self._yaw_cmd
+        bx, by = vision.get('body_x_m'), vision.get('body_y_m')
+        if bx is None or by is None or not (math.isfinite(bx) and math.isfinite(by)):
+            return self._yaw_cmd
+        if math.hypot(bx, by) < YAW_BEARING_MIN_M:
+            return self._yaw_cmd
+
         # one 30 Hz frame covers two 60 Hz ticks, and the step is relative to
         # the last command, so consuming it twice slews at double the limit
-        if view.frame_id is not None and view.frame_id == self._yaw_frame:
+        frame_id = vision.get('frame_id')
+        if frame_id is not None and frame_id == self._yaw_frame:
             return self._yaw_cmd
-        self._yaw_frame = view.frame_id
+        self._yaw_frame = frame_id
 
+        bearing = math.degrees(math.atan2(by, bx))
         step_limit = YAW_RATE_LIMIT_DEG_S / CONTROL_HZ
         correction = YAW_BEARING_SIGN * float(np.clip(
-            view.bearing_deg, -YAW_CLAMP_DEG, YAW_CLAMP_DEG))
+            bearing, -YAW_CLAMP_DEG, YAW_CLAMP_DEG))
         self._yaw_cmd += float(np.clip(correction, -step_limit, step_limit))
         self._yaw_cmd = (self._yaw_cmd + 180.0) % 360.0 - 180.0
         return self._yaw_cmd
@@ -532,16 +397,18 @@ class Controller:
 
     def _fly(self):
         """Run one guidance/control pass and send the resulting setpoint."""
-        with self._state_lock:
-            roll_deg, pitch_deg, yaw_deg = self._att_deg
-            v_down_ned = float(self.vel_ned[2])
-            v_fwd, v_right, v_down = (float(x) for x in self.vel_body)
-            quat = self.ahrs.quaternion
+        # attitude comes off the AHRS whether or not the filter has anchored,
+        # so an unanchored estimate still flies — on the VIS rung, as before.
+        est = self.vio.get_estimate()
+        roll_deg, pitch_deg, yaw_deg = est.rpy_deg
+        v_down_ned = float(est.vel[2])
+        v_fwd, v_right, v_down = (float(x) for x in est.vel_body)
+        quat = est.quat
 
         vision = self.data.get('vision_gate_estimate')
         vision_vel = self.data.get('vision_velocity')
 
-        view = self._observe_gate(vision, quat)
+        view = self._observe_gate(vision, quat, est)
         v_right, v_down, vel_source = self._fuse_velocity(
             vision_vel, view.frame_id, v_right, v_down)
         d_lateral, d_vertical, d_source = self._damping_terms(view, v_right, v_down_ned)
@@ -552,7 +419,7 @@ class Controller:
         d_lat = K_LAT_D * d_lateral * view.blend
         roll_target = float(np.clip(p_lat - d_lat, -MAX_BANK_DEG, MAX_BANK_DEG))
 
-        yaw_target = self._step_yaw(view)
+        yaw_target = self._step_yaw(vision)
 
         # PD on gate elevation, divided by lift lost to tilt.
         # positive elev_err = gate is below us
@@ -563,10 +430,11 @@ class Controller:
         thrust = float(np.clip(thrust, 0.0, 1.0))
 
         if self._tick % DEBUG_EVERY_N == 0:
-            print(f'[NAV] vel[{vel_source}]=({v_fwd:+5.1f}f {v_right:+5.1f}r {v_down:+5.1f}d) '
+            print(f'[NAV/{view.source}] '
+                  f'vel[{vel_source}]=({v_fwd:+5.1f}f {v_right:+5.1f}r {v_down:+5.1f}d) '
                   f'att=({roll_deg:+5.1f}r {pitch_deg:+5.1f}p {yaw_deg:+6.1f}y) '
                   f'gate=({view.fwd:+5.1f}f {view.right:+5.1f}r {view.down:+5.1f}d) '
-                  f'elev={elev_err:+5.2f} '
+                  f'elev={elev_err:+5.2f} age={est.age_s:.2f} '
                   f'D[{d_source}]=({d_lateral:+5.2f} {d_vertical:+5.2f}) '
                   f'cmd=(r={roll_target:+5.1f} y={yaw_target:+5.1f} T={thrust:.3f})',
                   flush=True)
@@ -579,8 +447,13 @@ class Controller:
 
     def _send_attitude_target(self, roll_deg, pitch_deg, yaw_deg, thrust):
         """Type mask 7 = use the quaternion, ignore the body-rate fields."""
-        with self._state_lock:
-            self._last_cmd_thrust = thrust
+        lock = self.data.get('lock')
+        if lock is not None and self.phase is Phase.FLYING:
+            # the estimator's acceleration cap reads this back. only while
+            # flying: on the pad the command is 0, and a zero cap scales the
+            # measured specific force away, leaving a free fall we aren't in
+            with lock:
+                self.data['cmd_thrust'] = thrust
         self.sim_conn.mav.set_attitude_target_send(
             int(time.time() * 1000) - self.system_boot_ms,
             self.sim_conn.target_system,

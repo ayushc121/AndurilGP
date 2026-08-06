@@ -63,7 +63,7 @@ vq1/        telemetry-guided controller + the first gate detector
 vq2/        vision-only controller, tracking detector, gate-relative VIO
 analysis/   offline accuracy scoring and detector replay, with sample data
 sysid/      system identification: thrust map and attitude dynamics
-tests/      90 tests, no simulator required
+tests/      101 tests, no simulator required
 ```
 
 ## Running
@@ -102,10 +102,10 @@ its own detector. The controller reads that state at a fixed rate and writes
 attitude setpoints back.
 
 Both qualifiers run four background threads — heartbeat, telemetry, clock sync
-and the camera — with the control loop on the main thread. VQ2 adds two more: a
-400 Hz strapdown thread inside the controller, and the gate-relative estimator.
-Both are deliberately decoupled from the 60 Hz control loop, since tying state
-estimation to the command rate throws away three quarters of the IMU data.
+and the camera — with the control loop on the main thread. VQ2 adds one more:
+the gate-relative estimator, at 400 Hz. It is deliberately decoupled from the
+60 Hz control loop, since tying state estimation to the command rate throws
+away three quarters of the IMU data.
 
 Both entry points run until interrupted. The sim disarms and re-arms between
 attempts and the controllers handle that in place, so one process covers a
@@ -144,10 +144,13 @@ completed run, so speed is what the remaining work is for.
 the route it intends to fly, which caps how fast it can safely go. A planning
 layer — mapping the course across attempts and flying a fitted trajectory
 through it, rather than reacting to one gate at a time — is what makes a faster
-line possible, and is required for any time-optimal method. A first attempt at
-this used a rapid motion primitive and failed in flight on a frame mismatch
-between the commanded and estimated yaw; the geometry was right and the wiring
-was not.
+line possible, and is required for any time-optimal method. A first attempt
+built the Mueller/Hehn/D'Andrea motion primitive with a differential-flatness
+mapping to attitude and thrust, deriving the quintic from the transversality
+conditions rather than transcribing it. It failed in flight on a frame
+mismatch between commanded and estimated yaw — the geometry was right and the
+wiring was not — so it is not in this repo. Nothing here is code the drone
+does not run.
 
 **Learned control.** A policy trained directly against lap time is the more
 ambitious version of the same goal, but it needs far more flight hours than

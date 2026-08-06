@@ -16,8 +16,8 @@ import time
 
 import numpy as np
 
-from .controller import (GyroAHRS, HOVER_THRUST, LAUNCH_PITCH_DEG,
-                         body_accel_to_ned, quat_to_R_wb)
+from .ahrs import (GyroAHRS, HOVER_THRUST, LAUNCH_PITCH_DEG,
+                   body_accel_to_ned, quat_to_R_wb)
 from .gate_ekf import GateEKF, build_R_anisotropic
 
 POLL_HZ = 400              # IMU predict rate, catches every ~120 Hz sample
@@ -82,6 +82,10 @@ class GateVIO:
         self._thread = None
         self._reset_state()
 
+    def reset(self):
+        """Reseed for a fresh run. Called on the sim's disarm edge."""
+        self._reset_state()
+
     def _reset_state(self):
         with self._lock:
             self.ahrs = GyroAHRS(initial_pitch_deg=LAUNCH_PITCH_DEG)
@@ -121,7 +125,10 @@ class GateVIO:
             stale = bool(self._need_anchor or not valid)
             quat = self.ahrs.quaternion
             rpy = self.ahrs.euler_deg()
-        age = (time.time() - self._last_accept_t) if self._last_accept_t else float('inf')
+            # read inside the lock: _reset_state can null it between the
+            # truthiness test and the subtraction
+            accepted_at = self._last_accept_t
+        age = (time.time() - accepted_at) if accepted_at else float('inf')
 
         R_bw = quat_to_R_wb(quat).T
         return VIOEstimate(p_rel=p, vel=v, stale=stale, age_s=age, valid=valid,

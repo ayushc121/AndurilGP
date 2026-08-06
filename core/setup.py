@@ -82,8 +82,12 @@ def run(components):
 def shutdown(components):
     """Signal each background thread to stop and wait for it."""
     print('Shutting down background threads...', flush=True)
-    for name in ('heartbeat', 'ts_loop', 'mavlink_rx', 'vision_rx', 'vio'):
+    for name in ('heartbeat', 'ts_loop', 'mavlink_rx', 'vision_rx', 'controller'):
         component = components.get(name)
-        if component is not None:
-            component.get_thread_for_join().join(timeout=2.0)
+        if component is None:
+            continue
+        getter = getattr(component, 'get_thread_for_join', None)
+        thread = getter() if getter else None
+        if thread is not None:      # VQ1's controller owns no worker thread
+            thread.join(timeout=2.0)
     print('Client exited.', flush=True)

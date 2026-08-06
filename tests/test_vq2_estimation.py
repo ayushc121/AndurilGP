@@ -6,6 +6,7 @@ import time
 import numpy as np
 import pytest
 
+from vq2 import ahrs as vq2_ahrs
 from vq2 import controller as vq2
 from vq2 import estimator as vq2_est
 
@@ -14,14 +15,14 @@ from vq2 import estimator as vq2_est
 
 def test_ahrs_seeds_at_launch_pitch():
     """The drone starts on an angled block; assuming level starts us wrong."""
-    ahrs = vq2.GyroAHRS(initial_pitch_deg=vq2.LAUNCH_PITCH_DEG)
+    ahrs = vq2_ahrs.GyroAHRS(initial_pitch_deg=vq2_ahrs.LAUNCH_PITCH_DEG)
     _, pitch, _ = ahrs.euler_deg()
-    assert pitch == pytest.approx(vq2.LAUNCH_PITCH_DEG, abs=1e-6)
+    assert pitch == pytest.approx(vq2_ahrs.LAUNCH_PITCH_DEG, abs=1e-6)
 
 
 def test_ahrs_holds_still_with_no_rotation():
     """Zero gyro input must not drift the attitude estimate."""
-    ahrs = vq2.GyroAHRS(initial_pitch_deg=-10.0)
+    ahrs = vq2_ahrs.GyroAHRS(initial_pitch_deg=-10.0)
     for _ in range(500):
         ahrs.update(0.0, 0.0, 0.0, 1 / 120)
     _, pitch, _ = ahrs.euler_deg()
@@ -30,7 +31,7 @@ def test_ahrs_holds_still_with_no_rotation():
 
 def test_ahrs_integrates_a_known_yaw_rate():
     """One second at 30 deg/s about the yaw axis is 30 degrees of yaw."""
-    ahrs = vq2.GyroAHRS()
+    ahrs = vq2_ahrs.GyroAHRS()
     rate = math.radians(30.0)
     for _ in range(1200):
         ahrs.update(0.0, 0.0, rate, 1 / 1200)
@@ -40,7 +41,7 @@ def test_ahrs_integrates_a_known_yaw_rate():
 
 def test_ahrs_keeps_quaternion_normalised():
     """Integration must renormalise, or the rotation silently gains scale."""
-    ahrs = vq2.GyroAHRS()
+    ahrs = vq2_ahrs.GyroAHRS()
     for i in range(2000):
         ahrs.update(0.5 * math.sin(i / 50), 0.3, -0.2, 1 / 120)
     assert np.linalg.norm(ahrs.quaternion) == pytest.approx(1.0, abs=1e-9)
@@ -52,7 +53,38 @@ def test_ahrs_keeps_quaternion_normalised():
 def ctrl(sim_conn, shared_data):
     controller = vq2.Controller(sim_conn, shared_data, 0)
     controller.phase = vq2.Phase.FLYING
+    seed_estimate(controller)
     return controller
+
+
+class FakeEstimate:
+    """Stands in for VIOEstimate so guidance tests can set state directly."""
+
+    def __init__(self, rpy=(0.0, 0.0, 0.0), vel=(0.0, 0.0, 0.0),
+                 gate_body=None, stale=False, valid=True):
+        self.rpy_deg = rpy
+        self.vel = np.array(vel, dtype=float)
+        self.vel_body = np.array(vel, dtype=float)
+        self.quat = np.array(vq2_ahrs.euler_to_quat(*(math.radians(a) for a in rpy)))
+        self.gate_body = None if gate_body is None else np.array(gate_body, dtype=float)
+        self.p_rel = np.zeros(3)
+        self.stale = stale
+        self.valid = valid
+        self.age_s = 0.0
+
+
+def sent_rpy_deg(sim_conn):
+    """Decode the last commanded quaternion back to roll/pitch/yaw degrees."""
+    ahrs = vq2_ahrs.GyroAHRS()
+    ahrs.q = np.array(sim_conn.mav.attitude_targets[-1]['quaternion'])
+    return ahrs.euler_deg()
+
+
+def seed_estimate(controller, **kwargs):
+    """Pin the controller's estimator to a known state."""
+    estimate = FakeEstimate(**kwargs)
+    controller.vio.get_estimate = lambda: estimate
+    return estimate
 
 
 def detection(fwd=20.0, right=0.0, down=0.0, frame_id=1, pnp=False):
@@ -190,11 +222,11 @@ def test_damping_falls_back_to_imu_between_frames(ctrl):
 
 def test_thrust_is_tilt_compensated(ctrl, sim_conn):
     """Banking must not cost altitude: thrust rises to cover the lift lost."""
-    ctrl._att_deg = (0.0, 0.0, 0.0)
+    seed_estimate(ctrl, rpy=(0.0, 0.0, 0.0))
     ctrl._fly()
     level = sim_conn.mav.attitude_targets[-1]['thrust']
 
-    ctrl._att_deg = (30.0, 0.0, 0.0)
+    seed_estimate(ctrl, rpy=(30.0, 0.0, 0.0))
     ctrl._fly()
     banked = sim_conn.mav.attitude_targets[-1]['thrust']
     assert banked > level
@@ -211,7 +243,7 @@ def test_thrust_stays_in_range(ctrl, sim_conn):
 
 def test_gate_below_reduces_thrust(ctrl, sim_conn):
     """Positive elevation error means the gate is below us — descend toward it."""
-    ctrl._att_deg = (0.0, 0.0, 0.0)
+    seed_estimate(ctrl, rpy=(0.0, 0.0, 0.0))
     ctrl._elev_err = 0.0
     ctrl._elev_err_at = time.monotonic()
     ctrl._fly()
@@ -255,10 +287,10 @@ def test_commands_use_absolute_attitude_mask(ctrl, sim_conn):
 def test_reset_clears_vision_state_but_keeps_estimator_running(ctrl):
     """A sim reset must not leave a previous run's gate memory behind."""
     ctrl._elev_err = 12.0
-    ctrl._tilt_ema = 4.0
+    ctrl._yaw_frame = 99
     ctrl._reset_flight_state()
     assert ctrl._elev_err == 0.0
-    assert ctrl._tilt_ema is None
+    assert ctrl._yaw_frame is None
     assert ctrl.phase is vq2.Phase.WAIT_FOR_DATA
 
 
@@ -271,15 +303,13 @@ def test_yaw_starts_at_the_pad_heading(ctrl):
 
 def test_yaw_holds_when_there_is_no_gate(ctrl):
     """No detection means no reason to move the setpoint."""
-    view = ctrl._observe_gate(None, IDENTITY_QUAT)
-    assert ctrl._step_yaw(view) == pytest.approx(vq2.LAUNCH_YAW_CMD_DEG)
+    assert ctrl._step_yaw(None) == pytest.approx(vq2.LAUNCH_YAW_CMD_DEG)
 
 
 def test_yaw_step_is_rate_limited(ctrl):
     """One noisy bearing must not snap the nose across the course."""
-    view = ctrl._observe_gate(detection(fwd=1.0, right=50.0), IDENTITY_QUAT)
     before = ctrl._yaw_cmd
-    after = ctrl._step_yaw(view)
+    after = ctrl._step_yaw(detection(fwd=1.0, right=50.0))
     assert abs(after - before) <= vq2.YAW_RATE_LIMIT_DEG_S / vq2.CONTROL_HZ + 1e-9
 
 
@@ -287,18 +317,14 @@ def test_yaw_walks_toward_an_offset_gate(ctrl):
     """Repeated steps should accumulate in one direction."""
     start = ctrl._yaw_cmd
     for i in range(20):
-        view = ctrl._observe_gate(detection(fwd=20.0, right=5.0, frame_id=i + 1),
-                                  IDENTITY_QUAT)
-        ctrl._step_yaw(view)
+        ctrl._step_yaw(detection(fwd=20.0, right=5.0, frame_id=i + 1))
     assert ctrl._yaw_cmd != pytest.approx(start)
 
 
 def test_yaw_setpoint_stays_wrapped(ctrl):
     """The setpoint must stay in [-180, 180) however far it is walked."""
     for i in range(400):
-        view = ctrl._observe_gate(detection(fwd=2.0, right=40.0, frame_id=i + 1),
-                                  IDENTITY_QUAT)
-        ctrl._step_yaw(view)
+        ctrl._step_yaw(detection(fwd=2.0, right=40.0, frame_id=i + 1))
         assert -180.0 <= ctrl._yaw_cmd < 180.0
 
 
@@ -311,15 +337,15 @@ def test_accel_cap_does_not_freeze_a_free_fall():
     thrust D term reads.
     """
     level = (1.0, 0.0, 0.0, 0.0)
-    a_ned, _, _ = vq2.body_accel_to_ned(level, 0.0, 0.0, 0.0, cmd_thrust=0.0)
-    assert a_ned[2] == pytest.approx(vq2.G, abs=1e-9)
+    a_ned, _, _ = vq2_ahrs.body_accel_to_ned(level, 0.0, 0.0, 0.0, cmd_thrust=0.0)
+    assert a_ned[2] == pytest.approx(vq2_ahrs.G, abs=1e-9)
 
 
 def test_accel_cap_bounds_an_implausible_reading():
     """A wild accelerometer sample is clipped to what the thrust could produce."""
     level = (1.0, 0.0, 0.0, 0.0)
-    a_ned, max_accel, saturated = vq2.body_accel_to_ned(
-        level, 500.0, 0.0, 0.0, cmd_thrust=vq2.HOVER_THRUST)
+    a_ned, max_accel, saturated = vq2_ahrs.body_accel_to_ned(
+        level, 500.0, 0.0, 0.0, cmd_thrust=vq2_ahrs.HOVER_THRUST)
     assert saturated
     assert a_ned[0] == pytest.approx(max_accel, rel=1e-9)
 
@@ -327,8 +353,8 @@ def test_accel_cap_bounds_an_implausible_reading():
 def test_accel_cap_passes_a_plausible_reading_through():
     """Inside the bound nothing is altered."""
     level = (1.0, 0.0, 0.0, 0.0)
-    a_ned, _, saturated = vq2.body_accel_to_ned(
-        level, 1.0, 0.0, 0.0, cmd_thrust=vq2.HOVER_THRUST)
+    a_ned, _, saturated = vq2_ahrs.body_accel_to_ned(
+        level, 1.0, 0.0, 0.0, cmd_thrust=vq2_ahrs.HOVER_THRUST)
     assert not saturated
     assert a_ned[0] == pytest.approx(1.0)
 
@@ -445,7 +471,110 @@ def test_range_noise_grows_with_range():
 
 def test_yaw_consumes_each_camera_frame_once(ctrl):
     """A 30 Hz frame spans two 60 Hz ticks; stepping twice doubles the slew."""
-    view = ctrl._observe_gate(detection(fwd=20.0, right=5.0, frame_id=7),
-                              IDENTITY_QUAT)
-    first = ctrl._step_yaw(view)
-    assert ctrl._step_yaw(view) == pytest.approx(first)
+    frame = detection(fwd=20.0, right=5.0, frame_id=7)
+    first = ctrl._step_yaw(frame)
+    assert ctrl._step_yaw(frame) == pytest.approx(first)
+
+
+# source ladder: the filter feeds guidance, vision is the fallback, blind steers nothing
+
+def test_gate_comes_from_the_filter_when_anchored(ctrl):
+    """A live anchor outranks the raw detection."""
+    seed_estimate(ctrl, gate_body=(30.0, 4.0, 0.0), stale=False)
+    view = ctrl._observe_gate(detection(fwd=10.0, right=-9.0),
+                              IDENTITY_QUAT, ctrl.vio.get_estimate())
+    assert view.source == 'EKF'
+    assert view.fwd == pytest.approx(30.0)
+    assert view.right == pytest.approx(4.0)
+
+
+def test_gate_falls_back_to_vision_when_the_anchor_is_stale(ctrl):
+    """Stale means the filter is coasting, so trust the camera instead."""
+    seed_estimate(ctrl, gate_body=(30.0, 4.0, 0.0), stale=True)
+    view = ctrl._observe_gate(detection(fwd=10.0, right=-9.0),
+                              IDENTITY_QUAT, ctrl.vio.get_estimate())
+    assert view.source == 'VIS'
+    assert view.fwd == pytest.approx(10.0)
+
+
+def test_no_anchor_and_no_detection_is_blind(ctrl):
+    """Neither rung available. Blind is a state, not a guess."""
+    seed_estimate(ctrl, gate_body=None, stale=True)
+    view = ctrl._observe_gate(None, IDENTITY_QUAT, ctrl.vio.get_estimate())
+    assert view.source == 'BLIND'
+    assert not view.valid
+
+
+def test_blind_does_not_steer(ctrl, sim_conn):
+    """Coasting on a drifting estimate measured 2.74 m/s of velocity error
+    against 0.56 while tracked, so blind holds wings level."""
+    seed_estimate(ctrl, gate_body=None, stale=True)
+    ctrl.data['vision_gate_estimate'] = None
+    ctrl._fly()
+    assert sent_rpy_deg(sim_conn)[0] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_blind_holds_the_current_heading(ctrl, sim_conn):
+    """Yaw is an absolute setpoint; with no gate there is nothing to steer to."""
+    seed_estimate(ctrl, gate_body=None, stale=True)
+    ctrl.data['vision_gate_estimate'] = None
+    before = ctrl._yaw_cmd
+    ctrl._fly()
+    assert ctrl._yaw_cmd == pytest.approx(before)
+
+
+def test_unanchored_filter_still_flies_on_raw_vision(ctrl, sim_conn):
+    """Before the first anchor the VIS rung carries the run — a launch-time PnP
+    failure must degrade to raw vision, not cost the whole flight."""
+    seed_estimate(ctrl, valid=False)
+    view = ctrl._observe_gate(detection(fwd=20.0, right=15.0),
+                              IDENTITY_QUAT, ctrl.vio.get_estimate())
+    assert view.source == 'VIS'
+    assert view.valid
+
+    ctrl.data['vision_gate_estimate'] = detection(fwd=20.0, right=15.0)
+    ctrl._fly()
+    assert sent_rpy_deg(sim_conn)[0] != pytest.approx(0.0, abs=1e-6)
+
+
+def test_commanded_thrust_is_published_for_the_accel_cap(ctrl):
+    """The estimator bounds acceleration by commanded thrust, so it has to see it."""
+    ctrl._fly()
+    assert ctrl.data['cmd_thrust'] == pytest.approx(
+        ctrl.sim_conn.mav.attitude_targets[-1]['thrust'])
+
+
+def test_controller_and_estimator_share_one_ahrs(ctrl):
+    """The whole point of the rewire: no second attitude integrator."""
+    assert not hasattr(ctrl, 'ahrs')
+    assert not hasattr(ctrl, 'vel_ned')
+
+
+def test_pad_hold_does_not_publish_its_zero_thrust(ctrl):
+    """On the pad the command is 0, and the estimator sizes its acceleration
+    cap as thrust squared — publishing 0 caps it at 0, which scales the
+    measured specific force away and integrates a free fall we are not in."""
+    ctrl.phase = vq2.Phase.WAIT_FOR_START
+    ctrl._wait_for_start(None)
+    assert ctrl.sim_conn.mav.attitude_targets[-1]['thrust'] == 0.0
+    assert ctrl.data['cmd_thrust'] == pytest.approx(vq2_ahrs.HOVER_THRUST)
+
+
+def test_sim_reset_reseeds_the_estimator(ctrl):
+    """A stale AHRS yaw across a reset snaps the nose to a wrong absolute
+    heading at release, so the reseed cannot depend on the sim's IMU clock."""
+    ctrl.vio.ahrs.update(0.0, 0.0, 2.0, 1.0)     # drift the heading
+    assert abs(ctrl.vio.ahrs.euler_deg()[2]) > 1.0
+    ctrl._reset_flight_state()
+    assert ctrl.vio.ahrs.euler_deg()[2] == pytest.approx(0.0, abs=1e-9)
+    assert ctrl.data['cmd_thrust'] == pytest.approx(vq2_ahrs.HOVER_THRUST)
+
+
+def test_yaw_ignores_the_filters_bearing(ctrl):
+    """est.gate_body is rotated by the AHRS; steering yaw on it closes the loop
+    over the filter's own yaw error. Raw camera bearing only."""
+    seed_estimate(ctrl, gate_body=(20.0, 15.0, 0.0), stale=False)
+    before = ctrl._yaw_cmd
+    ctrl.data['vision_gate_estimate'] = None
+    ctrl._fly()
+    assert ctrl._yaw_cmd == pytest.approx(before)
